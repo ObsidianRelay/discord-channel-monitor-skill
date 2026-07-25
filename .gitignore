@@ -1,0 +1,27 @@
+# Credentials and private runtime configuration
+*.env
+.env
+.env.*
+ticket-routes.json
+
+# Runtime data and logs
+data/
+logs/
+*.jsonl
+*.log
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS and editor files
+.DS_Store
+*.swp
+
+# Local backups and temporary files
+*.backup-*
+.*.tmp-*
+.venv-staging-*
