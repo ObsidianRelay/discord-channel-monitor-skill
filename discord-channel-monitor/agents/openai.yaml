@@ -1,0 +1,4 @@
+interface:
+  display_name: "Discord Channel Monitor"
+  short_description: "Manage read-only Discord message and ticket alerts"
+  default_prompt: "使用 $discord-channel-monitor 检查 Discord 监控服务状态并报告异常，不要修改配置。"
