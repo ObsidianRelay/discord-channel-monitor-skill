@@ -7,6 +7,9 @@ A private-first, public-ready Codex Skill for operating a read-only Discord Gate
 - A Codex Skill named `$discord-channel-monitor`
 - A Discord Gateway listener for one allowlisted message channel
 - Optional ticket-category routing to different Telegram destinations
+- Help message collection and five-minute unanswered-message alerts
+- Sleep recovery for missed Help messages and ticket creations
+- A 10:00 Help feedback summary with deterministic model fallback and cached delivery
 - A safe interactive installer and macOS LaunchAgent
 - Offline self-tests, read-only checks, and privacy-focused configuration guidance
 
@@ -27,6 +30,7 @@ Do not grant Administrator, Send Messages, Manage Messages, or Manage Roles.
 
 ```bash
 python3 discord-channel-monitor/scripts/monitor.py --self-test
+python3 discord-channel-monitor/scripts/help_daily_summary_source.py --self-test
 python3 discord-channel-monitor/scripts/install_monitor.py --self-test
 python3 discord-channel-monitor/scripts/install_monitor.py --dry-run
 ```
@@ -38,6 +42,8 @@ python3 discord-channel-monitor/scripts/install_monitor.py
 ```
 
 It stores credentials and runtime files under `~/.hermes/`, outside this repository.
+The installer copies the Help summary script but intentionally does not modify Hermes
+Cron. Review and approve the separate five-minute schedule before enabling it.
 
 ## Codex installation
 

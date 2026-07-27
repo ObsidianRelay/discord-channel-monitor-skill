@@ -19,6 +19,9 @@ from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 MONITOR_SOURCE = Path(__file__).resolve().parent / "monitor.py"
+HELP_DAILY_SOURCE = (
+    Path(__file__).resolve().parent / "help_daily_summary_source.py"
+)
 REQUIREMENTS_FILE = SKILL_DIR / "requirements.txt"
 DEFAULT_SERVICE_DIR = Path.home() / ".hermes" / "services" / "discord-channel-monitor"
 DEFAULT_ENV_FILE = Path.home() / ".hermes" / "discord-channel-monitor.env"
@@ -132,8 +135,13 @@ def render_env(config: dict[str, str]) -> str:
         "DISCORD_MONITOR_BOT_TOKEN",
         "DISCORD_MONITOR_CHANNEL_ID",
         "HERMES_NOTIFY_TARGET",
+        "HERMES_HELP_COLLECTION_TARGET",
         "HERMES_TICKET_NOTIFY_TARGET",
         "DISCORD_MONITOR_ROLE_IDS",
+        "DISCORD_MONITOR_EXCLUDED_ROLE_IDS",
+        "DISCORD_MONITOR_REPLY_ROLE_IDS",
+        "DISCORD_MESSAGE_NOTIFY_DELAY_SECONDS",
+        "HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS",
         "NOTIFY_BOT_MESSAGES",
         "SEND_STARTUP_NOTICE",
         "HERMES_BIN",
@@ -228,6 +236,11 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
         "HERMES_TICKET_NOTIFY_TARGET",
         input("工单默认通知目标 [与普通通知相同]: ") or notify_target,
     )
+    help_target = validate_single_line(
+        "HERMES_HELP_COLLECTION_TARGET",
+        input("Help 即时汇总和日报目标 [与普通通知相同]: ")
+        or notify_target,
+    )
     role_ids_raw = validate_single_line(
         "DISCORD_MONITOR_ROLE_IDS",
         input("允许提醒的身份组 ID（多个用逗号分隔，可留空）: "),
@@ -235,13 +248,32 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
     if role_ids_raw:
         for role_id in role_ids_raw.split(","):
             validate_discord_id("DISCORD_MONITOR_ROLE_IDS", role_id)
+    excluded_role_ids = validate_single_line(
+        "DISCORD_MONITOR_EXCLUDED_ROLE_IDS",
+        input("排除身份组 ID（Team/Mod/BD 等，多个用逗号分隔，可留空）: "),
+    )
+    if excluded_role_ids:
+        for role_id in excluded_role_ids.split(","):
+            validate_discord_id("DISCORD_MONITOR_EXCLUDED_ROLE_IDS", role_id)
+    reply_role_ids = validate_single_line(
+        "DISCORD_MONITOR_REPLY_ROLE_IDS",
+        input("可取消未回复提醒的 Team/Mod 身份组 ID（多个用逗号分隔）: "),
+    )
+    if reply_role_ids:
+        for role_id in reply_role_ids.split(","):
+            validate_discord_id("DISCORD_MONITOR_REPLY_ROLE_IDS", role_id)
 
     return {
         "DISCORD_MONITOR_BOT_TOKEN": token,
         "DISCORD_MONITOR_CHANNEL_ID": channel_id,
         "HERMES_NOTIFY_TARGET": notify_target,
+        "HERMES_HELP_COLLECTION_TARGET": help_target,
         "HERMES_TICKET_NOTIFY_TARGET": ticket_target,
         "DISCORD_MONITOR_ROLE_IDS": role_ids_raw,
+        "DISCORD_MONITOR_EXCLUDED_ROLE_IDS": excluded_role_ids,
+        "DISCORD_MONITOR_REPLY_ROLE_IDS": reply_role_ids,
+        "DISCORD_MESSAGE_NOTIFY_DELAY_SECONDS": "300",
+        "HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS": "30",
         "NOTIFY_BOT_MESSAGES": "false",
         "SEND_STARTUP_NOTICE": "true",
         "HERMES_BIN": str(hermes_bin),
@@ -257,10 +289,12 @@ def print_plan() -> None:
     print("安装计划（本次仅预览，不会执行）：")
     print(f"1. 检查 Hermes、Python 和源文件：{SKILL_DIR}")
     print(f"2. 创建独立运行目录：{DEFAULT_SERVICE_DIR}")
-    print(f"3. 创建虚拟环境并安装：{REQUIREMENTS_FILE}")
-    print(f"4. 写入受保护配置：{DEFAULT_ENV_FILE}（权限 600）")
-    print(f"5. 写入 LaunchAgent：{DEFAULT_LAUNCH_AGENT}")
-    print("6. 只有再次确认后才加载并启动后台服务")
+    print("3. 复制监听器和 Help 日报脚本到运行目录")
+    print(f"4. 创建虚拟环境并安装：{REQUIREMENTS_FILE}")
+    print(f"5. 写入受保护配置：{DEFAULT_ENV_FILE}（权限 600）")
+    print(f"6. 写入 LaunchAgent：{DEFAULT_LAUNCH_AGENT}")
+    print("7. 只有再次确认后才加载并启动后台服务")
+    print("不会自动新增或修改 Hermes Cron；日报调度需单独审核配置。")
     print("不会读取、复制或写入 Git 仓库中的真实 Discord 消息。")
 
 
@@ -275,6 +309,9 @@ def check_installation() -> int:
         )
     )
     checks.append(("监控源文件", MONITOR_SOURCE.is_file(), str(MONITOR_SOURCE)))
+    checks.append(
+        ("Help 日报源文件", HELP_DAILY_SOURCE.is_file(), str(HELP_DAILY_SOURCE))
+    )
     checks.append(
         ("依赖文件", REQUIREMENTS_FILE.is_file(), str(REQUIREMENTS_FILE))
     )
@@ -303,8 +340,12 @@ def check_installation() -> int:
         )
     )
     runtime_monitor = DEFAULT_SERVICE_DIR / "monitor.py"
+    runtime_help_daily = DEFAULT_SERVICE_DIR / "help_daily_summary_source.py"
     venv_python = DEFAULT_SERVICE_DIR / "venv" / "bin" / "python"
     checks.append(("运行副本", runtime_monitor.is_file(), str(runtime_monitor)))
+    checks.append(
+        ("Help 日报运行副本", runtime_help_daily.is_file(), str(runtime_help_daily))
+    )
     checks.append(("独立 Python", venv_python.is_file(), str(venv_python)))
     checks.append(
         ("LaunchAgent 文件", DEFAULT_LAUNCH_AGENT.is_file(), str(DEFAULT_LAUNCH_AGENT))
@@ -357,8 +398,12 @@ def install() -> int:
         raise RuntimeError("此安装器当前只支持 macOS。")
     if sys.version_info < (3, 11):
         raise RuntimeError("需要 Python 3.11 或更高版本。")
-    if not MONITOR_SOURCE.is_file() or not REQUIREMENTS_FILE.is_file():
-        raise RuntimeError("Skill 文件不完整，缺少监控程序或依赖文件。")
+    if (
+        not MONITOR_SOURCE.is_file()
+        or not HELP_DAILY_SOURCE.is_file()
+        or not REQUIREMENTS_FILE.is_file()
+    ):
+        raise RuntimeError("Skill 文件不完整，缺少监控程序、日报脚本或依赖文件。")
 
     existing_config = read_env_file(DEFAULT_ENV_FILE)
     hermes_bin = locate_hermes(existing_config)
@@ -416,6 +461,7 @@ def install() -> int:
     for path in (
         DEFAULT_ENV_FILE,
         DEFAULT_SERVICE_DIR / "monitor.py",
+        DEFAULT_SERVICE_DIR / "help_daily_summary_source.py",
         DEFAULT_LAUNCH_AGENT,
     ):
         backup = backup_file(path)
@@ -434,6 +480,12 @@ def install() -> int:
     shutil.copy2(MONITOR_SOURCE, temp_monitor)
     temp_monitor.chmod(0o700)
     temp_monitor.replace(runtime_monitor)
+
+    runtime_help_daily = DEFAULT_SERVICE_DIR / "help_daily_summary_source.py"
+    temp_help_daily = DEFAULT_SERVICE_DIR / f".help-daily.py.tmp-{os.getpid()}"
+    shutil.copy2(HELP_DAILY_SOURCE, temp_help_daily)
+    temp_help_daily.chmod(0o700)
+    temp_help_daily.replace(runtime_help_daily)
 
     safe_write_text(DEFAULT_ENV_FILE, render_env(config), 0o600)
     routes_file = DEFAULT_SERVICE_DIR / "ticket-routes.json"

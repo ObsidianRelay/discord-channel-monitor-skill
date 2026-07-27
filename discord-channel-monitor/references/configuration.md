@@ -29,14 +29,35 @@ The ticket event file stores only channel, category, owner, type, and time metad
 | `DISCORD_MONITOR_BOT_TOKEN` | Yes | Dedicated read-only Discord Bot Token |
 | `DISCORD_MONITOR_CHANNEL_ID` | Yes | One allowlisted message channel |
 | `HERMES_NOTIFY_TARGET` | Yes | Hermes destination, normally `telegram` or a Telegram chat/topic target |
+| `HERMES_HELP_COLLECTION_TARGET` | Yes | Help 即时汇总、未回复提醒和日报的 Telegram 目标 |
 | `HERMES_TICKET_NOTIFY_TARGET` | No | Default ticket destination; falls back to the normal target |
 | `DISCORD_MONITOR_ROLE_IDS` | No | Comma-separated role allowlist |
+| `DISCORD_MONITOR_EXCLUDED_ROLE_IDS` | No | Team、Mod、BD 等不作为普通用户提醒的身份组 |
+| `DISCORD_MONITOR_REPLY_ROLE_IDS` | No | 可以取消五分钟未回复提醒的 Team/Mod 身份组；不要包含 BD |
+| `DISCORD_MESSAGE_NOTIFY_DELAY_SECONDS` | No | 未回复提醒等待时间，默认 `300` |
+| `HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS` | No | 休眠补漏检查间隔，默认 `30` |
 | `NOTIFY_BOT_MESSAGES` | No | Defaults to `false` |
 | `SEND_STARTUP_NOTICE` | No | Defaults to `true` |
 | `HERMES_BIN` | No | Explicit Hermes executable path |
 | `DISCORD_MONITOR_STATE_DIR` | No | Runtime data directory |
 | `DISCORD_TICKET_ROUTES_FILE` | No | Ticket route JSON path |
 | `DISCORD_TICKET_EVENT_FILE` | No | Minimum-metadata ticket event file path |
+
+## Help alerts and daily summary
+
+- Help 新消息即时汇总只显示用户名和消息正文。
+- 用户消息等待五分钟仍未得到配置的 Team/Mod 回复时发送提醒。
+- BD 身份组不计为有效回复；Team/Mod 的回复、引用或提及可以取消提醒。
+- 电脑休眠或监听器离线后，监听器补查 Help 消息和新工单。
+- 日报脚本每五分钟可被 Hermes 静默调用，但仅在每天 10:00
+  到期或完整唤醒稳定两分钟后执行实际工作。
+- 最长补查七天；零条有效反馈时直接生成空日报，不调用 AI。
+- 有消息时按 `OnlyRouter → GonkaRouter → DeepSeek` 尝试，每个模型最多
+  60 秒。三个模型都失败后，保留统计进度并等待下一次完整唤醒重试。
+- Telegram 发送失败时缓存已生成日报，下次只重发，不重复调用模型。
+
+安装器只复制日报脚本，不会自动创建或修改 Hermes Cron。安排五分钟检查
+属于独立的配置变更，必须先展示具体任务并获得确认。
 
 Do not commit the real environment file. The installer reads it as plain `KEY=VALUE` data and never executes it as shell code.
 
@@ -81,6 +102,12 @@ Offline monitor test:
 python3 scripts/monitor.py --self-test
 ```
 
+Offline Help daily-summary test:
+
+```bash
+python3 scripts/help_daily_summary_source.py --self-test
+```
+
 Interactive installation:
 
 ```bash
@@ -92,6 +119,7 @@ The interactive command must be run only after the user approves the listed file
 ## Troubleshooting boundaries
 
 - A passing self-test proves only local formatting and routing logic.
+- The daily-summary self-test does not call Discord, Telegram, or any model.
 - A healthy LaunchAgent proves only that the process is running.
 - A real end-to-end result requires an approved message in the configured Discord channel and confirmed arrival at the configured Telegram destination.
 - Never enable Discord write permissions to solve a read or connection problem.

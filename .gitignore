@@ -9,6 +9,11 @@ data/
 logs/
 *.jsonl
 *.log
+pending/
+outbox/
+cron/
+*-state.json
+*pending*.json
 
 # Python environments and caches
 .venv/
@@ -23,5 +28,7 @@ __pycache__/
 
 # Local backups and temporary files
 *.backup-*
+*.bak
+*.bak.*
 .*.tmp-*
 .venv-staging-*
