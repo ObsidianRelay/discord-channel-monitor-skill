@@ -46,6 +46,8 @@ def resolve_hermes_bin() -> Path:
 
 DEFAULT_LOOKBACK_HOURS = 24.0
 RETENTION_HOURS = 168.0
+SILENT_CLOSE_HOURS = 72.0
+WAITING_LIFECYCLE_VERSION = 1
 MAX_PAGES = 100
 MAX_EXTERNAL_REFERENCES = 50
 MAX_REFERENCE_DEPTH = 3
@@ -538,6 +540,11 @@ def normalize_case_index(
         status = str(raw_case.get("status") or "")
         opened_at = parse_optional_time(raw_case.get("opened_at"))
         last_activity_at = parse_optional_time(raw_case.get("last_activity_at"))
+        waiting_since = parse_optional_time(raw_case.get("waiting_since"))
+        waiting_first_reported_at = parse_optional_time(
+            raw_case.get("waiting_first_reported_at")
+        )
+        silent_closed_at = parse_optional_time(raw_case.get("silent_closed_at"))
         if (
             not case_id
             or not user_id.isdigit()
@@ -582,9 +589,20 @@ def normalize_case_index(
             ),
             "opened_at": opened_at.isoformat(),
             "last_activity_at": last_activity_at.isoformat(),
+            "waiting_since": (
+                waiting_since.isoformat() if waiting_since else ""
+            ),
+            "waiting_first_reported_at": (
+                waiting_first_reported_at.isoformat()
+                if waiting_first_reported_at
+                else ""
+            ),
+            "silent_closed_at": (
+                silent_closed_at.isoformat() if silent_closed_at else ""
+            ),
         }
         if last_activity_at < cutoff:
-            if status != STATUS_RESOLVED:
+            if status != STATUS_RESOLVED and silent_closed_at is None:
                 normalized["archive_reason"] = "超过7天无更新，未确认解决"
             archived.append(normalized)
         else:
@@ -710,6 +728,9 @@ def compact_case_for_ai(
         ),
         "opened_at": case["opened_at"],
         "last_activity_at": case["last_activity_at"],
+        "temporarily_closed_for_silence": bool(
+            case.get("silent_closed_at")
+        ),
     }
 
 
@@ -809,7 +830,9 @@ def build_case_analysis_prompt(
         "9. existing_cases 中同一问题有更新时必须复用原 case_id；新案例"
         "的 case_id 留空，由程序生成。\n"
         "10. 本批次每条 author_kind=user 的消息 ID 必须出现在某个案例的"
-        " message_ids 或 ignored_message_ids 中，不能遗漏。\n\n"
+        " message_ids 或 ignored_message_ids 中，不能遗漏。\n"
+        "11. temporarily_closed_for_silence 只表示用户此前没有继续回复；"
+        "用户再次发送相关内容时仍必须复用该案例，不能视为已经解决。\n\n"
         "只输出一个 JSON 对象，不要 Markdown、解释或代码围栏。结构必须是：\n"
         '{"cases":[{"case_id":"","user_id":"","message_ids":[""],'
         '"staff_message_ids":[""],"resolution_evidence_message_id":"",'
@@ -1090,6 +1113,18 @@ def merge_case_result(
     user_candidates.sort(key=lambda item: item["sort_time"])
     latest_user = user_candidates[-1] if user_candidates else None
 
+    prior_waiting_since = str((prior or {}).get("waiting_since") or "")
+    prior_waiting_first_reported_at = str(
+        (prior or {}).get("waiting_first_reported_at") or ""
+    )
+    prior_silent_closed_at = str(
+        (prior or {}).get("silent_closed_at") or ""
+    )
+    if status != STATUS_WAITING_USER:
+        prior_waiting_since = ""
+        prior_waiting_first_reported_at = ""
+        prior_silent_closed_at = ""
+
     return {
         "case_id": case_id,
         "user_id": user_id,
@@ -1111,6 +1146,9 @@ def merge_case_result(
         "resolution_evidence_message_id": resolution_id,
         "opened_at": min(related_times).isoformat(),
         "last_activity_at": max(related_times).isoformat(),
+        "waiting_since": prior_waiting_since,
+        "waiting_first_reported_at": prior_waiting_first_reported_at,
+        "silent_closed_at": prior_silent_closed_at,
     }
 
 
@@ -1296,6 +1334,103 @@ def case_has_new_activity(
     )
 
 
+def apply_waiting_lifecycle(
+    *,
+    cases: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    end_time: datetime,
+    legacy_waiting_case_ids: set[str],
+    legacy_last_success_at: datetime | None,
+) -> tuple[set[str], set[str]]:
+    """推进72小时静默周期，并返回本次首次展示和暂时关闭的案例。"""
+    message_by_id = {item["id"]: item for item in messages}
+    first_report_case_ids: set[str] = set()
+    silently_closed_case_ids: set[str] = set()
+
+    for case in cases:
+        if case["status"] != STATUS_WAITING_USER:
+            case["waiting_since"] = ""
+            case["waiting_first_reported_at"] = ""
+            case["silent_closed_at"] = ""
+            continue
+
+        related_staff = [
+            message_by_id[message_id]
+            for message_id in (case.get("staff_message_ids") or [])
+            if message_id in message_by_id
+            and message_by_id[message_id]["author_kind"] == "staff"
+        ]
+        related_staff.sort(key=lambda item: item["sort_time"])
+        latest_staff_time = (
+            parse_discord_time(related_staff[-1]["sort_time"])
+            if related_staff
+            else parse_discord_time(case["last_activity_at"])
+        )
+        new_staff_times = [
+            parse_discord_time(item["sort_time"])
+            for item in related_staff
+            if item.get("is_new")
+        ]
+        has_new_activity = case_has_new_activity(case, message_by_id)
+
+        waiting_since = parse_optional_time(case.get("waiting_since"))
+        first_reported_at = parse_optional_time(
+            case.get("waiting_first_reported_at")
+        )
+        silent_closed_at = parse_optional_time(case.get("silent_closed_at"))
+
+        if silent_closed_at and has_new_activity:
+            if new_staff_times:
+                # 工作人员再次给出方案，开启新一轮等待验证。
+                waiting_since = max(new_staff_times)
+                first_reported_at = None
+                silent_closed_at = None
+            else:
+                # 用户重新发言但工作人员尚未再次处理，恢复人工跟进。
+                case["status"] = STATUS_REVIEW
+                case["waiting_since"] = ""
+                case["waiting_first_reported_at"] = ""
+                case["silent_closed_at"] = ""
+                continue
+
+        if waiting_since is None:
+            waiting_since = latest_staff_time
+        elif latest_staff_time > waiting_since + timedelta(seconds=1):
+            waiting_since = latest_staff_time
+            first_reported_at = None
+            silent_closed_at = None
+
+        if (
+            first_reported_at is None
+            and silent_closed_at is None
+            and case["case_id"] in legacy_waiting_case_ids
+            and legacy_last_success_at is not None
+        ):
+            # 旧版本每天都展示待验证问题，因此最后一次成功日报可视为已首报。
+            first_reported_at = legacy_last_success_at
+
+        case["waiting_since"] = waiting_since.isoformat()
+        case["waiting_first_reported_at"] = (
+            first_reported_at.isoformat() if first_reported_at else ""
+        )
+        case["silent_closed_at"] = (
+            silent_closed_at.isoformat() if silent_closed_at else ""
+        )
+
+        if silent_closed_at:
+            continue
+
+        close_due = waiting_since + timedelta(hours=SILENT_CLOSE_HOURS)
+        if end_time >= close_due:
+            case["silent_closed_at"] = end_time.isoformat()
+            silently_closed_case_ids.add(case["case_id"])
+        elif first_reported_at is None:
+            case["waiting_first_reported_at"] = end_time.isoformat()
+            first_report_case_ids.add(case["case_id"])
+
+    return first_report_case_ids, silently_closed_case_ids
+
+
 def public_user_label(case: dict[str, Any]) -> str:
     """输出可读用户名，不泄露内部 Discord 数字 ID。"""
     display = safe_public_text(case.get("user"), max_length=80) or "未知用户"
@@ -1316,6 +1451,14 @@ def case_line(case: dict[str, Any]) -> str:
     )
 
 
+def silent_close_line(case: dict[str, Any]) -> str:
+    """格式化用户静默关闭案例，不把它误写成已解决。"""
+    return (
+        f"• {public_user_label(case)}｜用户未回复，暂时关闭｜"
+        f"{safe_public_text(case['summary'], max_length=240)}"
+    )
+
+
 def build_daily_report(
     *,
     report_start: datetime,
@@ -1323,20 +1466,32 @@ def build_daily_report(
     cases: list[dict[str, Any]],
     messages: list[dict[str, Any]],
     archived_cases: list[dict[str, Any]],
+    first_report_case_ids: set[str] | None = None,
+    silently_closed_case_ids: set[str] | None = None,
 ) -> str:
     """由已校验案例生成确定性的 Telegram 日报。"""
+    first_report_case_ids = first_report_case_ids or set()
+    silently_closed_case_ids = silently_closed_case_ids or set()
     message_by_id = {item["id"]: item for item in messages}
     updated_open = [
         case
         for case in cases
-        if case["status"] in OPEN_STATUSES
-        and case_has_new_activity(case, message_by_id)
+        if (
+            case["status"] in OPEN_STATUSES - {STATUS_WAITING_USER}
+            and case_has_new_activity(case, message_by_id)
+        )
+        or case["case_id"] in first_report_case_ids
     ]
     pending = [
         case
         for case in cases
-        if case["status"] in OPEN_STATUSES
+        if case["status"] in OPEN_STATUSES - {STATUS_WAITING_USER}
         and not case_has_new_activity(case, message_by_id)
+    ]
+    silently_closed = [
+        case
+        for case in cases
+        if case["case_id"] in silently_closed_case_ids
     ]
     resolved_today = [
         case
@@ -1355,10 +1510,16 @@ def build_daily_report(
         f"统计区间：{start_local.strftime('%m-%d %H:%M')} 至 "
         f"{end_local.strftime('%m-%d %H:%M')}",
         f"新增/更新问题：{len(updated_open)}｜仍待跟进：{len(pending)}｜"
-        f"本次确认解决：{len(resolved_today)}",
+        f"本次确认解决：{len(resolved_today)}｜"
+        f"暂时关闭：{len(silently_closed)}",
     ]
 
-    if not updated_open and not pending and not resolved_today:
+    if (
+        not updated_open
+        and not pending
+        and not resolved_today
+        and not silently_closed
+    ):
         if archived_unresolved:
             lines.extend(
                 [
@@ -1380,6 +1541,15 @@ def build_daily_report(
     if resolved_today:
         lines.extend(["", "✅ 今日已解决"])
         lines.extend(case_line(case) for case in resolved_today)
+    if silently_closed:
+        lines.extend(
+            [
+                "",
+                "📦 暂时关闭（用户72小时未回复）",
+                "以下问题仅因用户未继续验证而暂时关闭，不代表已经解决。",
+            ]
+        )
+        lines.extend(silent_close_line(case) for case in silently_closed)
     if archived_unresolved:
         lines.extend(["", "📦 本次归档（未确认解决）"])
         lines.extend(case_line(case) for case in archived_unresolved)
@@ -1612,6 +1782,7 @@ def mark_success(
             "processed_message_ids": (
                 pending_processed if isinstance(pending_processed, list) else []
             ),
+            "waiting_lifecycle_version": WAITING_LIFECYCLE_VERSION,
             "retry_pending": False,
             "retry_after_wake_at": "",
             "last_ai_failure_at": "",
@@ -1668,8 +1839,20 @@ def build_report_from_discord(
         end_time=end_time,
     )
 
+    raw_state_cases = state.get("case_index")
+    legacy_waiting_case_ids: set[str] = set()
+    if state.get("waiting_lifecycle_version") != WAITING_LIFECYCLE_VERSION:
+        legacy_waiting_case_ids = {
+            str(case.get("case_id") or "")
+            for case in (raw_state_cases or [])
+            if isinstance(case, dict)
+            and case.get("status") == STATUS_WAITING_USER
+            and str(case.get("case_id") or "")
+        }
+    legacy_last_success_at = parse_optional_time(state.get("last_success_at"))
+
     active_cases, archived_cases = normalize_case_index(
-        state.get("case_index"),
+        raw_state_cases,
         end_time=end_time,
     )
     processed_ids = prune_processed_ids(
@@ -1707,12 +1890,21 @@ def build_report_from_discord(
         list(dict.fromkeys([*processed_ids, *[item["id"] for item in messages]])),
         end_time=end_time,
     )
+    first_report_case_ids, silently_closed_case_ids = apply_waiting_lifecycle(
+        cases=active_cases,
+        messages=messages,
+        end_time=end_time,
+        legacy_waiting_case_ids=legacy_waiting_case_ids,
+        legacy_last_success_at=legacy_last_success_at,
+    )
     report = build_daily_report(
         report_start=report_start,
         end_time=end_time,
         cases=active_cases,
         messages=messages,
         archived_cases=archived_cases,
+        first_report_case_ids=first_report_case_ids,
+        silently_closed_case_ids=silently_closed_case_ids,
     )
     parts = split_telegram_report(report)
     effective_user_messages = sum(
@@ -2256,6 +2448,118 @@ def self_test() -> None:
     assert "已转交处理中（尚未解决）" in report
     assert "100000000000000002" not in report
 
+    # 待用户验证只在首次和72小时静默关闭当天展示。
+    waiting_case_state = dict(waiting_cases[0])
+    waiting_context = [
+        {**item, "is_new": False} for item in [*messages, fix_claim]
+    ]
+    first_ids, closed_ids = apply_waiting_lifecycle(
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        end_time=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        legacy_waiting_case_ids=set(),
+        legacy_last_success_at=None,
+    )
+    assert first_ids == {waiting_case_state["case_id"]}
+    assert not closed_ids
+    first_report = build_daily_report(
+        report_start=datetime(2026, 7, 28, 1, tzinfo=timezone.utc),
+        end_time=datetime(2026, 7, 28, 12, tzinfo=timezone.utc),
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        archived_cases=[],
+        first_report_case_ids=first_ids,
+        silently_closed_case_ids=closed_ids,
+    )
+    assert "已回复待用户验证" in first_report
+
+    middle_first, middle_closed = apply_waiting_lifecycle(
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        end_time=datetime(2026, 7, 30, 1, 7, tzinfo=timezone.utc),
+        legacy_waiting_case_ids=set(),
+        legacy_last_success_at=None,
+    )
+    assert not middle_first and not middle_closed
+    middle_report = build_daily_report(
+        report_start=datetime(2026, 7, 29, 1, tzinfo=timezone.utc),
+        end_time=datetime(2026, 7, 30, 1, 7, tzinfo=timezone.utc),
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        archived_cases=[],
+        first_report_case_ids=middle_first,
+        silently_closed_case_ids=middle_closed,
+    )
+    assert "New Nickname" not in middle_report
+    assert "本统计区间暂无有效用户反馈" in middle_report
+
+    close_first, close_ids = apply_waiting_lifecycle(
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        end_time=datetime(2026, 7, 31, 1, 8, tzinfo=timezone.utc),
+        legacy_waiting_case_ids=set(),
+        legacy_last_success_at=None,
+    )
+    assert not close_first
+    assert close_ids == {waiting_case_state["case_id"]}
+    close_report = build_daily_report(
+        report_start=datetime(2026, 7, 30, 1, tzinfo=timezone.utc),
+        end_time=datetime(2026, 7, 31, 1, 8, tzinfo=timezone.utc),
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        archived_cases=[],
+        first_report_case_ids=close_first,
+        silently_closed_case_ids=close_ids,
+    )
+    assert "暂时关闭（用户72小时未回复）" in close_report
+    assert "不代表已经解决" in close_report
+    assert "本次确认解决：0" in close_report
+
+    later_first, later_closed = apply_waiting_lifecycle(
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        end_time=datetime(2026, 7, 31, 10, tzinfo=timezone.utc),
+        legacy_waiting_case_ids=set(),
+        legacy_last_success_at=None,
+    )
+    assert not later_first and not later_closed
+    later_report = build_daily_report(
+        report_start=datetime(2026, 7, 31, 1, 8, tzinfo=timezone.utc),
+        end_time=datetime(2026, 7, 31, 10, tzinfo=timezone.utc),
+        cases=[waiting_case_state],
+        messages=waiting_context,
+        archived_cases=[],
+        first_report_case_ids=later_first,
+        silently_closed_case_ids=later_closed,
+    )
+    assert "New Nickname" not in later_report
+
+    # 暂时关闭后用户重新发言会恢复原案例，而不是继续隐藏。
+    reopened_after_silence = {
+        **waiting_case_state,
+        "message_ids": [
+            *waiting_case_state["message_ids"],
+            "100000000000000016",
+        ],
+    }
+    reopened_user_message = sample_message(
+        message_id="100000000000000016",
+        timestamp="2026-07-31T11:00:00+00:00",
+        author_id="100000000000000002",
+        author_kind="user",
+        content="The problem is happening again.",
+        user="New Nickname",
+    )
+    apply_waiting_lifecycle(
+        cases=[reopened_after_silence],
+        messages=[*waiting_context, reopened_user_message],
+        end_time=datetime(2026, 7, 31, 11, 5, tzinfo=timezone.utc),
+        legacy_waiting_case_ids=set(),
+        legacy_last_success_at=None,
+    )
+    assert reopened_after_silence["status"] == STATUS_REVIEW
+    assert not reopened_after_silence["silent_closed_at"]
+
     long_report = "\n".join(["测试行" * 200 for _ in range(20)])
     parts = split_telegram_report(long_report, limit=500)
     assert len(parts) > 1
@@ -2340,7 +2644,7 @@ def self_test() -> None:
 
     print(
         "自检通过：跨天归并、角色过滤、状态校验、7天归档、"
-        "待跟进日报、模型切换和长消息分段均正常。"
+        "72小时静默关闭、重新打开、模型切换和长消息分段均正常。"
     )
 
 
