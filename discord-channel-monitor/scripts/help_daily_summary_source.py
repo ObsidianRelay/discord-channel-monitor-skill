@@ -1718,6 +1718,19 @@ def should_attempt_summary(
     return new_full_wake or next_day_due
 
 
+def resolve_daily_summary_target(env: dict[str, str]) -> str:
+    """读取独立日报目标；迁移期间兼容旧的逐条汇总目标配置。"""
+    target = env.get("HERMES_HELP_DAILY_SUMMARY_TARGET", "").strip()
+    if not target:
+        target = env.get("HERMES_HELP_COLLECTION_TARGET", "").strip()
+    if not target:
+        raise RuntimeError(
+            "配置中缺少 HERMES_HELP_DAILY_SUMMARY_TARGET；"
+            "兼容配置 HERMES_HELP_COLLECTION_TARGET 也为空。"
+        )
+    return target
+
+
 def send_to_telegram(target: str, message: str) -> None:
     """通过 Hermes 发送，并以退出码确认 Telegram 接收。"""
     code, stdout, stderr, timed_out = run_process(
@@ -1966,9 +1979,7 @@ def run_scheduled_summary() -> None:
         return
 
     env = load_env_file(ENV_FILE)
-    target = env.get("HERMES_HELP_COLLECTION_TARGET", "").strip()
-    if not target:
-        raise RuntimeError("配置中缺少 HERMES_HELP_COLLECTION_TARGET。")
+    target = resolve_daily_summary_target(env)
 
     pending_cutoff = parse_optional_time(state.get("pending_report_cutoff"))
     if (
@@ -2642,6 +2653,16 @@ def self_test() -> None:
     assert saved_indexes == [1]
     assert pending_state["pending_report_next_index"] == 1
 
+    assert resolve_daily_summary_target(
+        {
+            "HERMES_HELP_DAILY_SUMMARY_TARGET": "telegram:new",
+            "HERMES_HELP_COLLECTION_TARGET": "telegram:legacy",
+        }
+    ) == "telegram:new"
+    assert resolve_daily_summary_target(
+        {"HERMES_HELP_COLLECTION_TARGET": "telegram:legacy"}
+    ) == "telegram:legacy"
+
     print(
         "自检通过：跨天归并、角色过滤、状态校验、7天归档、"
         "72小时静默关闭、重新打开、模型切换和长消息分段均正常。"
@@ -2667,9 +2688,7 @@ def run_preview(*, hours: float | None, send_test: bool) -> None:
         )
 
     if send_test:
-        target = env.get("HERMES_HELP_COLLECTION_TARGET", "").strip()
-        if not target:
-            raise RuntimeError("配置中缺少 HERMES_HELP_COLLECTION_TARGET。")
+        target = resolve_daily_summary_target(env)
         for part in parts:
             send_to_telegram(target, "🧪 测试预览（不计入正式日报）\n\n" + part)
         print(

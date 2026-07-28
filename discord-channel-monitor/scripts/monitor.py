@@ -625,6 +625,15 @@ class DiscordChannelMonitor:
             "HERMES_HELP_COLLECTION_TARGET",
             "",
         ).strip()
+        self.help_collection_enabled = env_bool(
+            config.get("HELP_COLLECTION_ENABLED"),
+            default=bool(self.help_collection_target),
+        )
+        if self.help_collection_enabled and not self.help_collection_target:
+            raise RuntimeError(
+                "HELP_COLLECTION_ENABLED=true 时必须配置 "
+                "HERMES_HELP_COLLECTION_TARGET。"
+            )
         self.ticket_default_target = (
             config.get("HERMES_TICKET_NOTIFY_TARGET", self.telegram_target).strip()
             or self.telegram_target
@@ -949,6 +958,25 @@ class DiscordChannelMonitor:
         temporary_file.chmod(0o600)
         temporary_file.replace(HELP_MESSAGE_STATE_FILE)
 
+    async def discard_disabled_help_collection_outbox(self) -> None:
+        """关闭逐条汇总时丢弃旧发送队列，避免重启后补发到日报话题。"""
+        if self.help_collection_enabled:
+            return
+        async with self.help_message_lock:
+            collection_outbox = self.help_message_state.get("collection_outbox")
+            discarded_count = (
+                len(collection_outbox)
+                if isinstance(collection_outbox, dict)
+                else 0
+            )
+            self.help_message_state["collection_outbox"] = {}
+            self.save_help_message_state()
+        if discarded_count:
+            print(
+                f"Help 逐条汇总已关闭，已丢弃 {discarded_count} 条旧汇总任务。",
+                flush=True,
+            )
+
     async def process_help_message(self, payload: dict[str, Any]) -> None:
         """处理 help 消息：立即汇总、延迟提醒，或根据工作人员回复取消。"""
         if str(payload.get("channel_id") or "") != self.channel_id:
@@ -983,7 +1011,10 @@ class DiscordChannelMonitor:
             elif member_has_any_role(payload, self.excluded_role_ids):
                 pass
             elif member_has_allowed_role(payload, self.allowed_role_ids):
-                if self.help_collection_target:
+                if (
+                    self.help_collection_enabled
+                    and self.help_collection_target
+                ):
                     collection_outbox = self.help_message_state.setdefault(
                         "collection_outbox",
                         {},
@@ -1474,6 +1505,7 @@ class DiscordChannelMonitor:
                     await heartbeat_task
 
     async def run(self) -> None:
+        await self.discard_disabled_help_collection_outbox()
         self.telegram_target = await resolve_hermes_target(self.telegram_target)
         worker_task = asyncio.create_task(self.notification_worker())
         reconciliation_task: asyncio.Task[None] | None = None
@@ -1483,6 +1515,11 @@ class DiscordChannelMonitor:
 
         if self.send_startup_notice:
             delay_minutes = max(1, round(self.message_notify_delay_seconds / 60))
+            help_collection_status = (
+                "Help 消息逐条汇总仍然实时发送；"
+                if self.help_collection_enabled
+                else "Help 消息逐条汇总已关闭，每日总结仍按计划发送；"
+            )
             try:
                 self.notification_queue.put_nowait(
                     (
@@ -1490,7 +1527,8 @@ class DiscordChannelMonitor:
                         "✅ Discord 监控已启动。"
                         f"聊天消息会等待 {delay_minutes} 分钟确认，"
                         "工作人员未回复时再通知；"
-                        "Help 消息汇总和工单提醒仍然实时发送。",
+                        f"{help_collection_status}"
+                        "工单提醒仍然实时发送。",
                     ),
                 )
             except asyncio.QueueFull:
@@ -1508,9 +1546,10 @@ class DiscordChannelMonitor:
                 help_reconciliation_task = asyncio.create_task(
                     self.help_message_reconciliation_loop(session)
                 )
-                help_collection_task = asyncio.create_task(
-                    self.help_collection_outbox_loop(session)
-                )
+                if self.help_collection_enabled:
+                    help_collection_task = asyncio.create_task(
+                        self.help_collection_outbox_loop(session)
+                    )
                 try:
                     retry_delay = 2
                     while not self.stop_event.is_set():
@@ -1535,11 +1574,15 @@ class DiscordChannelMonitor:
                             pass
                         retry_delay = min(retry_delay * 2, 60)
                 finally:
-                    tasks = (
-                        help_collection_task,
-                        help_reconciliation_task,
-                        pending_message_task,
-                        reconciliation_task,
+                    tasks = tuple(
+                        task
+                        for task in (
+                            help_collection_task,
+                            help_reconciliation_task,
+                            pending_message_task,
+                            reconciliation_task,
+                        )
+                        if task is not None
                     )
                     for task in tasks:
                         task.cancel()
