@@ -705,8 +705,11 @@ class DiscordChannelMonitor:
         self.recorded_ticket_channel_ids = load_recorded_ticket_channel_ids()
         self.pending_message_alerts = load_pending_message_alerts()
         self.pending_message_lock = asyncio.Lock()
+        self.pending_message_wakeup = asyncio.Event()
         self.help_message_state = load_help_message_state()
         self.help_message_lock = asyncio.Lock()
+        self.help_reconciliation_lock = asyncio.Lock()
+        self.help_reconciliation_ready = asyncio.Event()
         self.help_reconciliation_requested = asyncio.Event()
         self.ticket_reconciliation_requested = asyncio.Event()
         self.hermes_send_lock = asyncio.Lock()
@@ -754,7 +757,12 @@ class DiscordChannelMonitor:
         temporary_file.chmod(0o600)
         temporary_file.replace(PENDING_MESSAGE_FILE)
 
-    async def queue_pending_message_alert(self, payload: dict[str, Any]) -> None:
+    async def queue_pending_message_alert(
+        self,
+        payload: dict[str, Any],
+        *,
+        wake_pending_loop: bool = True,
+    ) -> None:
         """按用户合并消息，并从第一条消息开始计算五分钟等待时间。"""
         channel_id = str(payload.get("channel_id") or "")
         guild_id = str(payload.get("guild_id") or "")
@@ -794,6 +802,8 @@ class DiscordChannelMonitor:
             f"Discord 消息 {message_id} / 已合并 {message_count} 条",
             flush=True,
         )
+        if wake_pending_loop:
+            self.pending_message_wakeup.set()
 
     async def cancel_pending_from_staff_response(
         self,
@@ -856,12 +866,15 @@ class DiscordChannelMonitor:
             after_message_id = next_after
         return False
 
-    async def pending_message_notification_loop(
+    async def process_due_pending_messages(
         self,
         session: aiohttp.ClientSession,
-    ) -> None:
-        """到期后复查工作人员回复；无人回复才发送 Telegram。"""
-        while not self.stop_event.is_set():
+    ) -> int:
+        """处理当前已到期的提醒；补收未完整结束时保持静默。"""
+        processed_count = 0
+        async with self.help_reconciliation_lock:
+            if not self.help_reconciliation_ready.is_set():
+                return 0
             now = time.time()
             async with self.pending_message_lock:
                 due_items = [
@@ -922,6 +935,7 @@ class DiscordChannelMonitor:
                         f"等待期结束且无人回复，已发送 Telegram：{pending_key}",
                         flush=True,
                     )
+                    processed_count += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -938,10 +952,20 @@ class DiscordChannelMonitor:
                         file=sys.stderr,
                         flush=True,
                     )
+        return processed_count
 
+    async def pending_message_notification_loop(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        """补收完成后立即检查到期提醒；平时最多每5秒检查一次。"""
+        while not self.stop_event.is_set():
+            await self.help_reconciliation_ready.wait()
+            self.pending_message_wakeup.clear()
+            await self.process_due_pending_messages(session)
             try:
                 await asyncio.wait_for(
-                    self.stop_event.wait(),
+                    self.pending_message_wakeup.wait(),
                     timeout=PENDING_MESSAGE_CHECK_INTERVAL_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -977,7 +1001,12 @@ class DiscordChannelMonitor:
                 flush=True,
             )
 
-    async def process_help_message(self, payload: dict[str, Any]) -> None:
+    async def process_help_message(
+        self,
+        payload: dict[str, Any],
+        *,
+        wake_pending_loop: bool = True,
+    ) -> None:
         """处理 help 消息：立即汇总、延迟提醒，或根据工作人员回复取消。"""
         if str(payload.get("channel_id") or "") != self.channel_id:
             return
@@ -1024,7 +1053,10 @@ class DiscordChannelMonitor:
                         "guild_id": guild_id,
                         "next_attempt_at": 0.0,
                     }
-                await self.queue_pending_message_alert(payload)
+                await self.queue_pending_message_alert(
+                    payload,
+                    wake_pending_loop=wake_pending_loop,
+                )
 
             self.help_message_state["last_seen_message_id"] = message_id
             self.save_help_message_state()
@@ -1043,61 +1075,136 @@ class DiscordChannelMonitor:
     async def reconcile_help_messages(
         self,
         session: aiohttp.ClientSession,
+        *,
+        gateway_payload: dict[str, Any] | None = None,
     ) -> None:
-        """补收 Gateway 断线或电脑休眠期间的 help 频道消息。"""
-        async with self.help_message_lock:
-            last_seen_message_id = str(
-                self.help_message_state.get("last_seen_message_id") or ""
-            )
+        """串行补收 Help 历史，并在整批完成后才放行到期提醒。"""
+        async with self.help_reconciliation_lock:
+            self.help_reconciliation_ready.clear()
+            reconciliation_completed = False
+            try:
+                async with self.help_message_lock:
+                    last_seen_message_id = str(
+                        self.help_message_state.get("last_seen_message_id") or ""
+                    )
 
-        if not last_seen_message_id:
-            latest_messages = await self.discord_api_get(
-                session,
-                f"/channels/{self.channel_id}/messages?limit=1",
-            )
-            baseline_message_id = ""
-            if isinstance(latest_messages, list) and latest_messages:
-                baseline_message_id = str(latest_messages[0].get("id") or "")
-            async with self.help_message_lock:
-                if not self.help_message_state.get("last_seen_message_id"):
-                    self.help_message_state["last_seen_message_id"] = baseline_message_id
-                    self.save_help_message_state()
-            print(
-                f"Help 消息汇总基线已建立：{baseline_message_id or '频道暂无消息'}",
-                flush=True,
-            )
-            return
+                if not last_seen_message_id:
+                    gateway_message_id = str(
+                        (gateway_payload or {}).get("id") or ""
+                    )
+                    if (
+                        gateway_message_id.isdigit()
+                        and str(
+                            (gateway_payload or {}).get("channel_id") or ""
+                        )
+                        == self.channel_id
+                    ):
+                        await self.process_help_message(
+                            dict(gateway_payload or {}),
+                            wake_pending_loop=False,
+                        )
+                        print(
+                            f"Help 首条实时消息已建立游标：{gateway_message_id}",
+                            flush=True,
+                        )
+                    else:
+                        latest_messages = await self.discord_api_get(
+                            session,
+                            f"/channels/{self.channel_id}/messages?limit=1",
+                        )
+                        baseline_message_id = ""
+                        if isinstance(latest_messages, list) and latest_messages:
+                            baseline_message_id = str(
+                                latest_messages[0].get("id") or ""
+                            )
+                        async with self.help_message_lock:
+                            if not self.help_message_state.get(
+                                "last_seen_message_id"
+                            ):
+                                self.help_message_state[
+                                    "last_seen_message_id"
+                                ] = baseline_message_id
+                                self.save_help_message_state()
+                        print(
+                            "Help 消息汇总基线已建立："
+                            f"{baseline_message_id or '频道暂无消息'}",
+                            flush=True,
+                        )
+                    reconciliation_completed = True
+                    return
 
-        guild_id = await self.resolve_help_guild_id(session)
-        after_message_id = last_seen_message_id
-        unseen_messages: dict[str, dict[str, Any]] = {}
-        for _ in range(10):
-            messages = await self.discord_api_get(
-                session,
-                f"/channels/{self.channel_id}/messages?"
-                f"after={after_message_id}&limit=100",
-            )
-            if not isinstance(messages, list):
-                raise RuntimeError("Help 消息补收返回了意外的数据格式。")
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                message_id = str(message.get("id") or "")
-                if message_id.isdigit():
-                    message["guild_id"] = str(message.get("guild_id") or guild_id)
-                    unseen_messages[message_id] = message
-            if len(messages) < 100:
-                break
-            next_after = max(
-                (str(message.get("id") or "0") for message in messages),
-                key=int,
-            )
-            if next_after == after_message_id:
-                break
-            after_message_id = next_after
+                guild_id = await self.resolve_help_guild_id(session)
+                after_message_id = last_seen_message_id
+                unseen_messages: dict[str, dict[str, Any]] = {}
+                for _ in range(10):
+                    messages = await self.discord_api_get(
+                        session,
+                        f"/channels/{self.channel_id}/messages?"
+                        f"after={after_message_id}&limit=100",
+                    )
+                    if not isinstance(messages, list):
+                        raise RuntimeError(
+                            "Help 消息补收返回了意外的数据格式。"
+                        )
+                    for message in messages:
+                        if not isinstance(message, dict):
+                            continue
+                        message_id = str(message.get("id") or "")
+                        if message_id.isdigit():
+                            message["guild_id"] = str(
+                                message.get("guild_id") or guild_id
+                            )
+                            unseen_messages[message_id] = message
+                    if len(messages) < 100:
+                        break
+                    next_after = max(
+                        (
+                            str(message.get("id") or "0")
+                            for message in messages
+                        ),
+                        key=int,
+                    )
+                    if next_after == after_message_id:
+                        break
+                    after_message_id = next_after
 
-        for message_id in sorted(unseen_messages, key=int):
-            await self.process_help_message(unseen_messages[message_id])
+                gateway_message_id = str(
+                    (gateway_payload or {}).get("id") or ""
+                )
+                if (
+                    gateway_message_id.isdigit()
+                    and int(gateway_message_id) > int(last_seen_message_id)
+                    and str(
+                        (gateway_payload or {}).get("channel_id") or ""
+                    )
+                    == self.channel_id
+                ):
+                    gateway_message = dict(gateway_payload or {})
+                    gateway_message["guild_id"] = str(
+                        gateway_message.get("guild_id") or guild_id
+                    )
+                    unseen_messages[gateway_message_id] = gateway_message
+
+                ordered_message_ids = sorted(unseen_messages, key=int)
+                for message_id in ordered_message_ids:
+                    await self.process_help_message(
+                        unseen_messages[message_id],
+                        wake_pending_loop=False,
+                    )
+
+                if ordered_message_ids:
+                    print(
+                        "Help 有序补收完成："
+                        f"{len(ordered_message_ids)} 条 / "
+                        f"{ordered_message_ids[0]} → "
+                        f"{ordered_message_ids[-1]}",
+                        flush=True,
+                    )
+                reconciliation_completed = True
+            finally:
+                if reconciliation_completed:
+                    self.help_reconciliation_ready.set()
+                    self.pending_message_wakeup.set()
 
     async def help_message_reconciliation_loop(
         self,
@@ -1361,8 +1468,43 @@ class DiscordChannelMonitor:
             finally:
                 self.notification_queue.task_done()
 
-    async def handle_message_create(self, payload: dict[str, Any]) -> None:
-        await self.process_help_message(payload)
+    async def handle_message_create(
+        self,
+        session: aiohttp.ClientSession,
+        payload: dict[str, Any],
+    ) -> None:
+        """实时 Help 消息先与历史补收合并，禁止新消息越过旧游标。"""
+        if str(payload.get("channel_id") or "") != self.channel_id:
+            return
+        self.help_reconciliation_ready.clear()
+        try:
+            await self.reconcile_help_messages(
+                session,
+                gateway_payload=payload,
+            )
+        except Exception:
+            self.help_reconciliation_requested.set()
+            raise
+
+    async def reconcile_help_after_gateway_connection(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        connection_label: str,
+    ) -> None:
+        """连接或恢复后优先补收；失败时保留游标并交给后台重试。"""
+        self.help_reconciliation_ready.clear()
+        try:
+            await self.reconcile_help_messages(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.help_reconciliation_requested.set()
+            print(
+                f"{connection_label}后的 Help 优先补收失败：{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     async def handle_ticket_channel(self, payload: dict[str, Any]) -> None:
         """分类命中时，将新工单频道推送到对应 Telegram 目标。"""
@@ -1474,15 +1616,21 @@ class DiscordChannelMonitor:
                             self.session_id = str(data.get("session_id", "")) or None
                             self.resume_gateway_url = str(data.get("resume_gateway_url", "")) or None
                             self.ticket_reconciliation_requested.set()
-                            self.help_reconciliation_requested.set()
+                            await self.reconcile_help_after_gateway_connection(
+                                session,
+                                connection_label="Discord 连接",
+                            )
                             print("Discord 连接成功，正在监听指定频道。", flush=True)
                         elif event_type == "RESUMED":
                             self.ticket_reconciliation_requested.set()
-                            self.help_reconciliation_requested.set()
+                            await self.reconcile_help_after_gateway_connection(
+                                session,
+                                connection_label="Discord 会话恢复",
+                            )
                             print("Discord 会话已恢复，继续监听。", flush=True)
                         elif event_type == "MESSAGE_CREATE":
                             try:
-                                await self.handle_message_create(data)
+                                await self.handle_message_create(session, data)
                             except Exception as exc:  # 单条通知失败不能让长期监听退出
                                 print(f"处理消息失败：{exc}", file=sys.stderr, flush=True)
                         elif event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE"}:
