@@ -22,6 +22,9 @@ MONITOR_SOURCE = Path(__file__).resolve().parent / "monitor.py"
 HELP_DAILY_SOURCE = (
     Path(__file__).resolve().parent / "help_daily_summary_source.py"
 )
+SUPPORT_OCR_SOURCE = (
+    Path(__file__).resolve().parent / "support_vision_ocr.m"
+)
 REQUIREMENTS_FILE = SKILL_DIR / "requirements.txt"
 DEFAULT_SERVICE_DIR = Path.home() / ".hermes" / "services" / "discord-channel-monitor"
 DEFAULT_ENV_FILE = Path.home() / ".hermes" / "discord-channel-monitor.env"
@@ -32,6 +35,7 @@ LAUNCH_AGENT_LABEL = "local.discord-channel-monitor"
 REQUIRED_CONFIG_KEYS = {
     "DISCORD_MONITOR_BOT_TOKEN",
     "DISCORD_MONITOR_CHANNEL_ID",
+    "DISCORD_SUPPORT_CATEGORY_ID",
 }
 CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -134,6 +138,7 @@ def render_env(config: dict[str, str]) -> str:
     preferred_order = [
         "DISCORD_MONITOR_BOT_TOKEN",
         "DISCORD_MONITOR_CHANNEL_ID",
+        "DISCORD_SUPPORT_CATEGORY_ID",
         "HERMES_NOTIFY_TARGET",
         "HERMES_HELP_COLLECTION_TARGET",
         "HERMES_TICKET_NOTIFY_TARGET",
@@ -142,12 +147,18 @@ def render_env(config: dict[str, str]) -> str:
         "DISCORD_MONITOR_REPLY_ROLE_IDS",
         "DISCORD_MESSAGE_NOTIFY_DELAY_SECONDS",
         "HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS",
+        "SUPPORT_OCR_ENABLED",
+        "SUPPORT_OCR_MAX_IMAGES",
+        "SUPPORT_OCR_MAX_BYTES",
+        "SUPPORT_OCR_TIMEOUT_SECONDS",
+        "SUPPORT_OCR_MIN_CONFIDENCE",
         "NOTIFY_BOT_MESSAGES",
         "SEND_STARTUP_NOTICE",
         "HERMES_BIN",
         "DISCORD_MONITOR_STATE_DIR",
         "DISCORD_TICKET_ROUTES_FILE",
         "DISCORD_TICKET_EVENT_FILE",
+        "DISCORD_SUPPORT_MESSAGE_STATE_FILE",
     ]
     ordered_keys = [key for key in preferred_order if key in config]
     ordered_keys.extend(sorted(set(config) - set(ordered_keys)))
@@ -216,6 +227,41 @@ def run_command(args: list[str], check: bool = True) -> subprocess.CompletedProc
     )
 
 
+def build_support_ocr_helper(destination: Path) -> None:
+    """使用 macOS 系统框架构建本地 OCR，不安装第三方 OCR 依赖。"""
+    if not SUPPORT_OCR_SOURCE.is_file():
+        raise RuntimeError(f"缺少 Support OCR 源码：{SUPPORT_OCR_SOURCE}")
+    clang = shutil.which("clang")
+    if not clang:
+        raise RuntimeError("找不到 clang，无法构建 Support 本地 OCR。")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = run_command(
+        [
+            clang,
+            "-fobjc-arc",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-framework",
+            "Foundation",
+            "-framework",
+            "AppKit",
+            "-framework",
+            "Vision",
+            "-o",
+            str(destination),
+            str(SUPPORT_OCR_SOURCE),
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Support OCR 构建失败："
+            + (result.stderr.strip() or f"退出码 {result.returncode}")
+        )
+    destination.chmod(0o755)
+
+
 def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
     token = validate_single_line(
         "DISCORD_MONITOR_BOT_TOKEN",
@@ -227,6 +273,10 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
     channel_id = validate_discord_id(
         "DISCORD_MONITOR_CHANNEL_ID",
         input("要监控的 Discord 频道 ID: "),
+    )
+    support_category_id = validate_discord_id(
+        "DISCORD_SUPPORT_CATEGORY_ID",
+        input("Support 工单分类 ID（用于只读采集正文和截图）: "),
     )
     notify_target = validate_single_line(
         "HERMES_NOTIFY_TARGET",
@@ -266,6 +316,7 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
     return {
         "DISCORD_MONITOR_BOT_TOKEN": token,
         "DISCORD_MONITOR_CHANNEL_ID": channel_id,
+        "DISCORD_SUPPORT_CATEGORY_ID": support_category_id,
         "HERMES_NOTIFY_TARGET": notify_target,
         "HERMES_HELP_COLLECTION_TARGET": help_target,
         "HERMES_TICKET_NOTIFY_TARGET": ticket_target,
@@ -274,6 +325,11 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
         "DISCORD_MONITOR_REPLY_ROLE_IDS": reply_role_ids,
         "DISCORD_MESSAGE_NOTIFY_DELAY_SECONDS": "300",
         "HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS": "30",
+        "SUPPORT_OCR_ENABLED": "true",
+        "SUPPORT_OCR_MAX_IMAGES": "3",
+        "SUPPORT_OCR_MAX_BYTES": "8388608",
+        "SUPPORT_OCR_TIMEOUT_SECONDS": "20",
+        "SUPPORT_OCR_MIN_CONFIDENCE": "0.45",
         "NOTIFY_BOT_MESSAGES": "false",
         "SEND_STARTUP_NOTICE": "true",
         "HERMES_BIN": str(hermes_bin),
@@ -282,6 +338,9 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
         "DISCORD_TICKET_EVENT_FILE": str(
             service_dir / "data" / "ticket-events.jsonl"
         ),
+        "DISCORD_SUPPORT_MESSAGE_STATE_FILE": str(
+            service_dir / "data" / "support-message-state.json"
+        ),
     }
 
 
@@ -289,11 +348,12 @@ def print_plan() -> None:
     print("安装计划（本次仅预览，不会执行）：")
     print(f"1. 检查 Hermes、Python 和源文件：{SKILL_DIR}")
     print(f"2. 创建独立运行目录：{DEFAULT_SERVICE_DIR}")
-    print("3. 复制监听器和 Help 日报脚本到运行目录")
-    print(f"4. 创建虚拟环境并安装：{REQUIREMENTS_FILE}")
-    print(f"5. 写入受保护配置：{DEFAULT_ENV_FILE}（权限 600）")
-    print(f"6. 写入 LaunchAgent：{DEFAULT_LAUNCH_AGENT}")
-    print("7. 只有再次确认后才加载并启动后台服务")
+    print("3. 复制监听器、Help 日报脚本和 Support OCR 源码")
+    print("4. 使用 macOS clang + Apple Vision 构建本地 OCR 辅助程序")
+    print(f"5. 创建虚拟环境并安装：{REQUIREMENTS_FILE}")
+    print(f"6. 写入受保护配置：{DEFAULT_ENV_FILE}（权限 600）")
+    print(f"7. 写入 LaunchAgent：{DEFAULT_LAUNCH_AGENT}")
+    print("8. 只有再次确认后才加载并启动后台服务")
     print("不会自动新增或修改 Hermes Cron；日报调度需单独审核配置。")
     print("不会读取、复制或写入 Git 仓库中的真实 Discord 消息。")
 
@@ -311,6 +371,16 @@ def check_installation() -> int:
     checks.append(("监控源文件", MONITOR_SOURCE.is_file(), str(MONITOR_SOURCE)))
     checks.append(
         ("Help 日报源文件", HELP_DAILY_SOURCE.is_file(), str(HELP_DAILY_SOURCE))
+    )
+    checks.append(
+        ("Support OCR 源码", SUPPORT_OCR_SOURCE.is_file(), str(SUPPORT_OCR_SOURCE))
+    )
+    checks.append(
+        (
+            "clang",
+            shutil.which("clang") is not None,
+            shutil.which("clang") or "未找到",
+        )
     )
     checks.append(
         ("依赖文件", REQUIREMENTS_FILE.is_file(), str(REQUIREMENTS_FILE))
@@ -341,10 +411,19 @@ def check_installation() -> int:
     )
     runtime_monitor = DEFAULT_SERVICE_DIR / "monitor.py"
     runtime_help_daily = DEFAULT_SERVICE_DIR / "help_daily_summary_source.py"
+    runtime_ocr_helper = DEFAULT_SERVICE_DIR / "bin" / "support_vision_ocr"
     venv_python = DEFAULT_SERVICE_DIR / "venv" / "bin" / "python"
     checks.append(("运行副本", runtime_monitor.is_file(), str(runtime_monitor)))
     checks.append(
         ("Help 日报运行副本", runtime_help_daily.is_file(), str(runtime_help_daily))
+    )
+    checks.append(
+        (
+            "Support OCR 运行程序",
+            runtime_ocr_helper.is_file()
+            and os.access(runtime_ocr_helper, os.X_OK),
+            str(runtime_ocr_helper),
+        )
     )
     checks.append(("独立 Python", venv_python.is_file(), str(venv_python)))
     checks.append(
@@ -369,6 +448,7 @@ def run_self_test() -> int:
     fake_config = {
         "DISCORD_MONITOR_BOT_TOKEN": "example-token-never-use",
         "DISCORD_MONITOR_CHANNEL_ID": "100000000000000002",
+        "DISCORD_SUPPORT_CATEGORY_ID": "100000000000000003",
         "HERMES_NOTIFY_TARGET": "telegram",
     }
     env_text = render_env(fake_config)
@@ -389,6 +469,10 @@ def run_self_test() -> int:
         parsed = plistlib.loads(plist_bytes)
         assert parsed["Label"] == LAUNCH_AGENT_LABEL
         assert "example-token-never-use" not in plist_bytes.decode("utf-8")
+        ocr_helper = root / "support_vision_ocr"
+        build_support_ocr_helper(ocr_helper)
+        assert ocr_helper.is_file()
+        assert os.access(ocr_helper, os.X_OK)
     print("安装器自检通过：配置权限和 LaunchAgent 生成逻辑正常。")
     return 0
 
@@ -401,6 +485,7 @@ def install() -> int:
     if (
         not MONITOR_SOURCE.is_file()
         or not HELP_DAILY_SOURCE.is_file()
+        or not SUPPORT_OCR_SOURCE.is_file()
         or not REQUIREMENTS_FILE.is_file()
     ):
         raise RuntimeError("Skill 文件不完整，缺少监控程序、日报脚本或依赖文件。")
@@ -425,6 +510,19 @@ def install() -> int:
         config["DISCORD_TICKET_EVENT_FILE"] = str(
             DEFAULT_SERVICE_DIR / "data" / "ticket-events.jsonl"
         )
+        config["DISCORD_SUPPORT_MESSAGE_STATE_FILE"] = str(
+            DEFAULT_SERVICE_DIR / "data" / "support-message-state.json"
+        )
+        if not config.get("DISCORD_SUPPORT_CATEGORY_ID", "").strip():
+            config["DISCORD_SUPPORT_CATEGORY_ID"] = validate_discord_id(
+                "DISCORD_SUPPORT_CATEGORY_ID",
+                input("Support 工单分类 ID（用于只读采集正文和截图）: "),
+            )
+        config.setdefault("SUPPORT_OCR_ENABLED", "true")
+        config.setdefault("SUPPORT_OCR_MAX_IMAGES", "3")
+        config.setdefault("SUPPORT_OCR_MAX_BYTES", "8388608")
+        config.setdefault("SUPPORT_OCR_TIMEOUT_SECONDS", "20")
+        config.setdefault("SUPPORT_OCR_MIN_CONFIDENCE", "0.45")
     else:
         config = collect_new_config(hermes_bin, DEFAULT_SERVICE_DIR)
 
@@ -435,6 +533,7 @@ def install() -> int:
     DEFAULT_SERVICE_DIR.mkdir(parents=True, exist_ok=True)
     (DEFAULT_SERVICE_DIR / "logs").mkdir(parents=True, exist_ok=True)
     (DEFAULT_SERVICE_DIR / "data").mkdir(parents=True, exist_ok=True)
+    (DEFAULT_SERVICE_DIR / "bin").mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     staging_venv = DEFAULT_SERVICE_DIR / f".venv-staging-{timestamp}"
@@ -462,6 +561,7 @@ def install() -> int:
         DEFAULT_ENV_FILE,
         DEFAULT_SERVICE_DIR / "monitor.py",
         DEFAULT_SERVICE_DIR / "help_daily_summary_source.py",
+        DEFAULT_SERVICE_DIR / "bin" / "support_vision_ocr",
         DEFAULT_LAUNCH_AGENT,
     ):
         backup = backup_file(path)
@@ -486,6 +586,18 @@ def install() -> int:
     shutil.copy2(HELP_DAILY_SOURCE, temp_help_daily)
     temp_help_daily.chmod(0o700)
     temp_help_daily.replace(runtime_help_daily)
+
+    runtime_ocr_helper = DEFAULT_SERVICE_DIR / "bin" / "support_vision_ocr"
+    temp_ocr_helper = DEFAULT_SERVICE_DIR / "bin" / (
+        f".support_vision_ocr.tmp-{os.getpid()}"
+    )
+    try:
+        build_support_ocr_helper(temp_ocr_helper)
+        temp_ocr_helper.replace(runtime_ocr_helper)
+        runtime_ocr_helper.chmod(0o755)
+    finally:
+        if temp_ocr_helper.exists():
+            temp_ocr_helper.unlink()
 
     safe_write_text(DEFAULT_ENV_FILE, render_env(config), 0o600)
     routes_file = DEFAULT_SERVICE_DIR / "ticket-routes.json"

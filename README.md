@@ -14,6 +14,8 @@ Hermes to Telegram.
 - Sleep recovery for missed Help messages and ticket creations
 - A 10:00 Help feedback summary with the fixed
   `OnlyRouter → GonkaRouter → DeepSeek` fallback order
+- Optional local Apple Vision OCR for structured order and logistics fields in
+  ordinary-user Support screenshots
 - Cached Telegram delivery without repeating successful model generation
 - A safe interactive installer and macOS LaunchAgent
 - Offline self-tests, read-only checks, and privacy-focused configuration guidance
@@ -54,6 +56,12 @@ Do not grant:
 
 This Skill is designed for read-only monitoring. It does not provide Discord
 message sending, deletion, banning, or role-management features.
+
+Support OCR downloads only allowlisted Discord JPG, PNG, or WebP attachments,
+uses Apple Vision locally, and deletes each temporary image after processing.
+The public version extracts structured order and logistics fields only. It does
+not include general screenshot problem understanding or website/App bug
+classification.
 
 ## Local validation
 

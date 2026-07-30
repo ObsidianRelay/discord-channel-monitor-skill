@@ -4,6 +4,7 @@
 
 - macOS
 - Python 3.11 or later
+- Xcode Command Line Tools with `clang`
 - Hermes installed and able to send to the intended Telegram chat or topic
 - A dedicated Discord Bot with Message Content Intent enabled
 
@@ -17,6 +18,8 @@ The Skill source contains no credentials or collected messages. The installer us
 - Runtime: `~/.hermes/services/discord-channel-monitor/`
 - Ticket routes: `~/.hermes/services/discord-channel-monitor/ticket-routes.json`
 - Ticket event metadata: `~/.hermes/services/discord-channel-monitor/data/ticket-events.jsonl`
+- Support message index: `~/.hermes/services/discord-channel-monitor/data/support-message-state.json`
+- Local OCR helper: `~/.hermes/services/discord-channel-monitor/bin/support_vision_ocr`
 - Logs: `~/.hermes/services/discord-channel-monitor/logs/`
 - LaunchAgent: `~/Library/LaunchAgents/local.discord-channel-monitor.plist`
 
@@ -28,6 +31,7 @@ The ticket event file stores only channel, category, owner, type, and time metad
 | --- | --- | --- |
 | `DISCORD_MONITOR_BOT_TOKEN` | Yes | Dedicated read-only Discord Bot Token |
 | `DISCORD_MONITOR_CHANNEL_ID` | Yes | One allowlisted message channel |
+| `DISCORD_SUPPORT_CATEGORY_ID` | Yes | Support Ticket Tool category read by the local message/OCR collector |
 | `HERMES_NOTIFY_TARGET` | Yes | Hermes destination, normally `telegram` or a Telegram chat/topic target |
 | `HERMES_HELP_COLLECTION_TARGET` | Yes | Help 即时汇总、未回复提醒和日报的 Telegram 目标 |
 | `HERMES_TICKET_NOTIFY_TARGET` | No | Default ticket destination; falls back to the normal target |
@@ -42,6 +46,12 @@ The ticket event file stores only channel, category, owner, type, and time metad
 | `DISCORD_MONITOR_STATE_DIR` | No | Runtime data directory |
 | `DISCORD_TICKET_ROUTES_FILE` | No | Ticket route JSON path |
 | `DISCORD_TICKET_EVENT_FILE` | No | Minimum-metadata ticket event file path |
+| `DISCORD_SUPPORT_MESSAGE_STATE_FILE` | No | Protected seven-day Support message and OCR index |
+| `SUPPORT_OCR_ENABLED` | No | Enable local Support screenshot OCR; defaults to `false` unless configured |
+| `SUPPORT_OCR_MAX_IMAGES` | No | Maximum eligible screenshots per message; maximum `3` |
+| `SUPPORT_OCR_MAX_BYTES` | No | Maximum bytes per screenshot; default `8388608` |
+| `SUPPORT_OCR_TIMEOUT_SECONDS` | No | Timeout per screenshot; default `20` |
+| `SUPPORT_OCR_MIN_CONFIDENCE` | No | Minimum accepted Apple Vision confidence; default `0.45` |
 
 ## Help alerts and daily summary
 
@@ -55,6 +65,39 @@ The ticket event file stores only channel, category, owner, type, and time metad
 - 有消息时按 `OnlyRouter → GonkaRouter → DeepSeek` 尝试，每个模型最多
   60 秒。三个模型都失败后，保留统计进度并等待下一次完整唤醒重试。
 - Telegram 发送失败时缓存已生成日报，下次只重发，不重复调用模型。
+
+## Support screenshot OCR
+
+- Process only ordinary-user screenshots in the configured Support category.
+- Accept JPG, PNG, and WebP from Discord attachment hosts only.
+- Process at most three screenshots per message and 8 MB per screenshot.
+- Use Apple Vision locally. Do not install Tesseract and do not send the source
+  image or complete OCR text to an external model.
+- Extract only explicit order, product, platform, amount, carrier, tracking,
+  shipping-status, refund, fee, and update-time fields.
+- Remove names, addresses, telephone numbers, email addresses, credentials, and
+  payment evidence. Replace order numbers, tracking numbers, and product links
+  with placeholders before model analysis; restore allowed business fields
+  locally when rendering the Telegram daily summary.
+- Delete temporary images after success or failure. Keep only sanitized
+  structured fields and OCR status for seven days.
+- Mark low-confidence, unsupported, or failed screenshots for manual review.
+  Do not infer a problem from product photos or other non-text images.
+
+This public version intentionally does not include general screenshot problem
+understanding, website/App bug classification, prompt extraction, or visual
+reasoning. It only performs local structured OCR for order and logistics data.
+
+```text
+SUPPORT_OCR_ENABLED=true
+SUPPORT_OCR_MAX_IMAGES=3
+SUPPORT_OCR_MAX_BYTES=8388608
+SUPPORT_OCR_TIMEOUT_SECONDS=20
+SUPPORT_OCR_MIN_CONFIDENCE=0.45
+```
+
+The Discord Bot still needs only `View Channel` and `Read Message History` in
+Support tickets. It must not receive permission to send or manage messages.
 
 安装器只复制日报脚本，不会自动创建或修改 Hermes Cron。安排五分钟检查
 属于独立的配置变更，必须先展示具体任务并获得确认。
