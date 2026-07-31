@@ -46,6 +46,7 @@ TICKET_ROUTES_FILE = BASE_DIR / "ticket-routes.json"
 PENDING_MESSAGE_FILE = BASE_DIR / "data" / "pending-message-alerts.json"
 HELP_MESSAGE_STATE_FILE = BASE_DIR / "data" / "help-message-state.json"
 TICKET_MESSAGE_STATE_FILE = BASE_DIR / "data" / "ticket-message-state.json"
+MEMBER_STATS_STATE_FILE = BASE_DIR / "data" / "member-stats-state.json"
 LEGACY_SUPPORT_MESSAGE_STATE_FILE = (
     BASE_DIR / "data" / "support-message-state.json"
 )
@@ -54,6 +55,7 @@ DEFAULT_TICKET_RECONCILE_INTERVAL_SECONDS = 60.0
 DEFAULT_MESSAGE_NOTIFY_DELAY_SECONDS = 300.0
 PENDING_MESSAGE_CHECK_INTERVAL_SECONDS = 5.0
 DEFAULT_HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS = 30.0
+DEFAULT_MEMBER_STATS_RECONCILE_INTERVAL_SECONDS = 300.0
 HELP_COLLECTION_CHECK_INTERVAL_SECONDS = 5.0
 SUPPORT_MESSAGE_RETENTION_HOURS = 168.0
 SUPPORT_MAX_CONTENT_LENGTH = 1200
@@ -90,6 +92,10 @@ SUPPORT_OCR_ISSUE_FACT_KINDS = {
     "observed_symptom",
 }
 MESSAGE_SEPARATOR = "━━━━━━━━━━━━━━━━"
+MEMBER_STATS_NAME_PATTERN = re.compile(
+    r"^\s*Verified\s*:\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$",
+    re.IGNORECASE,
+)
 ACTIVE_BUSINESS_PROFILE: BusinessProfile = GENERIC_PROFILE
 ACTIVE_BUSINESS_PROFILE_DIGEST = ""
 
@@ -212,7 +218,8 @@ def configure_runtime(config: dict[str, str]) -> None:
     global HERMES_BIN
     global TICKET_EVENT_FILE, TICKET_ROUTES_FILE
     global PENDING_MESSAGE_FILE, HELP_MESSAGE_STATE_FILE
-    global TICKET_MESSAGE_STATE_FILE, LEGACY_SUPPORT_MESSAGE_STATE_FILE
+    global TICKET_MESSAGE_STATE_FILE, MEMBER_STATS_STATE_FILE
+    global LEGACY_SUPPORT_MESSAGE_STATE_FILE
     global SUPPORT_OCR_HELPER
 
     configured_hermes = str(config.get("HERMES_BIN") or "").strip()
@@ -254,6 +261,11 @@ def configure_runtime(config: dict[str, str]) -> None:
         config,
         "DISCORD_TICKET_MESSAGE_STATE_FILE",
         state_dir / "data" / "ticket-message-state.json",
+    )
+    MEMBER_STATS_STATE_FILE = configured_path(
+        config,
+        "DISCORD_MEMBER_STATS_STATE_FILE",
+        state_dir / "data" / "member-stats-state.json",
     )
     LEGACY_SUPPORT_MESSAGE_STATE_FILE = configured_path(
         config,
@@ -484,6 +496,44 @@ def load_help_message_state() -> dict[str, Any]:
     return {
         "last_seen_message_id": last_seen_message_id,
         "collection_outbox": collection_outbox,
+    }
+
+
+def parse_verified_member_count(channel_name: str) -> int | None:
+    """严格读取 ``Verified: 数字``，兼容空格和千分位逗号。"""
+    match = MEMBER_STATS_NAME_PATTERN.fullmatch(str(channel_name or ""))
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
+def load_member_stats_state() -> dict[str, Any]:
+    """只恢复最新人数和观察时间，不保存任何成员资料。"""
+    empty_state: dict[str, Any] = {
+        "version": 1,
+        "current_count": None,
+        "observed_at": "",
+    }
+    if not MEMBER_STATS_STATE_FILE.exists():
+        return empty_state
+    try:
+        payload = json.loads(
+            MEMBER_STATS_STATE_FILE.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError):
+        return empty_state
+    if not isinstance(payload, dict):
+        return empty_state
+    try:
+        current_count = int(payload.get("current_count"))
+    except (TypeError, ValueError):
+        current_count = None
+    if current_count is not None and current_count < 0:
+        current_count = None
+    return {
+        "version": 1,
+        "current_count": current_count,
+        "observed_at": str(payload.get("observed_at") or ""),
     }
 
 
@@ -1613,6 +1663,16 @@ class DiscordChannelMonitor:
         self.channel_id = require_config(config, "DISCORD_MONITOR_CHANNEL_ID")
         if not self.channel_id.isdigit():
             raise RuntimeError("DISCORD_MONITOR_CHANNEL_ID 必须是纯数字频道 ID。")
+        self.member_stats_channel_id = str(
+            config.get("DISCORD_MEMBER_STATS_CHANNEL_ID") or ""
+        ).strip()
+        if (
+            self.member_stats_channel_id
+            and not self.member_stats_channel_id.isdigit()
+        ):
+            raise RuntimeError(
+                "DISCORD_MEMBER_STATS_CHANNEL_ID 必须是纯数字频道 ID。"
+            )
 
         self.telegram_target = config.get("HERMES_NOTIFY_TARGET", "telegram").strip() or "telegram"
         self.help_collection_target = config.get(
@@ -1764,6 +1824,21 @@ class DiscordChannelMonitor:
             15.0,
             configured_help_reconcile_interval,
         )
+        try:
+            configured_member_stats_interval = float(
+                config.get(
+                    "MEMBER_STATS_RECONCILE_INTERVAL_SECONDS",
+                    str(DEFAULT_MEMBER_STATS_RECONCILE_INTERVAL_SECONDS),
+                )
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "MEMBER_STATS_RECONCILE_INTERVAL_SECONDS 必须是数字。"
+            ) from exc
+        self.member_stats_reconcile_interval_seconds = max(
+            60.0,
+            configured_member_stats_interval,
+        )
         self.allowed_role_ids = parse_id_set(
             config.get("DISCORD_MONITOR_ROLE_IDS"),
             "DISCORD_MONITOR_ROLE_IDS",
@@ -1801,6 +1876,9 @@ class DiscordChannelMonitor:
         self.help_reconciliation_ready = asyncio.Event()
         self.help_reconciliation_requested = asyncio.Event()
         self.ticket_reconciliation_requested = asyncio.Event()
+        self.member_stats_state = load_member_stats_state()
+        self.member_stats_lock = asyncio.Lock()
+        self.member_stats_reconciliation_requested = asyncio.Event()
         self.support_message_state = load_support_message_state()
         self.support_message_lock = asyncio.Lock()
         self.support_reconciliation_lock = asyncio.Lock()
@@ -2118,6 +2196,97 @@ class DiscordChannelMonitor:
         )
         temporary_file.chmod(0o600)
         temporary_file.replace(HELP_MESSAGE_STATE_FILE)
+
+    def save_member_stats_state(self) -> None:
+        """原子保存最新人数；文件仅当前用户可读写。"""
+        MEMBER_STATS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = MEMBER_STATS_STATE_FILE.with_suffix(".json.tmp")
+        temporary_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "current_count": self.member_stats_state.get(
+                        "current_count"
+                    ),
+                    "observed_at": str(
+                        self.member_stats_state.get("observed_at") or ""
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary_file.chmod(0o600)
+        temporary_file.replace(MEMBER_STATS_STATE_FILE)
+
+    async def handle_member_stats_channel(
+        self,
+        payload: dict[str, Any],
+    ) -> bool:
+        """记录统计频道的新名称，不发送任何实时 Telegram 通知。"""
+        if (
+            not self.member_stats_channel_id
+            or str(payload.get("id") or "") != self.member_stats_channel_id
+        ):
+            return False
+        count = parse_verified_member_count(str(payload.get("name") or ""))
+        if count is None:
+            print(
+                "已验证成员统计频道名称格式无效，保留上次记录。",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        async with self.member_stats_lock:
+            self.member_stats_state = {
+                "version": 1,
+                "current_count": count,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.save_member_stats_state()
+        print(f"已更新已验证成员人数：{count}", flush=True)
+        return True
+
+    async def reconcile_member_stats_channel(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        """启动、重连及定时读取当前频道名称，补回离线后的最终值。"""
+        if not self.member_stats_channel_id:
+            return
+        payload = await self.discord_api_get(
+            session,
+            f"/channels/{self.member_stats_channel_id}",
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("已验证成员统计频道返回了意外的数据格式。")
+        await self.handle_member_stats_channel(payload)
+
+    async def member_stats_reconciliation_loop(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        """定时刷新人数，并响应 Gateway 重连/唤醒后的立即补读。"""
+        while not self.stop_event.is_set():
+            try:
+                await self.reconcile_member_stats_channel(session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    f"已验证成员人数读取失败：{exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
+                await asyncio.wait_for(
+                    self.member_stats_reconciliation_requested.wait(),
+                    timeout=self.member_stats_reconcile_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self.member_stats_reconciliation_requested.clear()
 
     def prune_support_message_state(
         self,
@@ -3801,6 +3970,7 @@ class DiscordChannelMonitor:
                             self.session_id = str(data.get("session_id", "")) or None
                             self.resume_gateway_url = str(data.get("resume_gateway_url", "")) or None
                             self.ticket_reconciliation_requested.set()
+                            self.member_stats_reconciliation_requested.set()
                             await self.reconcile_help_after_gateway_connection(
                                 session,
                                 connection_label="Discord 连接",
@@ -3808,6 +3978,7 @@ class DiscordChannelMonitor:
                             print("Discord 连接成功，正在监听指定频道。", flush=True)
                         elif event_type == "RESUMED":
                             self.ticket_reconciliation_requested.set()
+                            self.member_stats_reconciliation_requested.set()
                             await self.reconcile_help_after_gateway_connection(
                                 session,
                                 connection_label="Discord 会话恢复",
@@ -3820,6 +3991,8 @@ class DiscordChannelMonitor:
                                 print(f"处理消息失败：{exc}", file=sys.stderr, flush=True)
                         elif event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE"}:
                             try:
+                                if event_type == "CHANNEL_UPDATE":
+                                    await self.handle_member_stats_channel(data)
                                 await self.handle_ticket_channel(data)
                             except Exception as exc:
                                 print(f"处理工单频道失败：{exc}", file=sys.stderr, flush=True)
@@ -3855,6 +4028,7 @@ class DiscordChannelMonitor:
         help_reconciliation_task: asyncio.Task[None] | None = None
         help_collection_task: asyncio.Task[None] | None = None
         support_ocr_task: asyncio.Task[None] | None = None
+        member_stats_task: asyncio.Task[None] | None = None
 
         if self.send_startup_notice:
             delay_minutes = max(1, round(self.message_notify_delay_seconds / 60))
@@ -3889,6 +4063,10 @@ class DiscordChannelMonitor:
                 help_reconciliation_task = asyncio.create_task(
                     self.help_message_reconciliation_loop(session)
                 )
+                if self.member_stats_channel_id:
+                    member_stats_task = asyncio.create_task(
+                        self.member_stats_reconciliation_loop(session)
+                    )
                 if self.support_ocr_enabled:
                     support_ocr_task = asyncio.create_task(
                         self.support_ocr_worker(session)
@@ -3924,6 +4102,7 @@ class DiscordChannelMonitor:
                     tasks = tuple(
                         task
                         for task in (
+                            member_stats_task,
                             support_ocr_task,
                             help_collection_task,
                             help_reconciliation_task,
@@ -3945,6 +4124,10 @@ class DiscordChannelMonitor:
 
 def self_test() -> None:
     help_spam_state_self_test()
+    assert parse_verified_member_count("Verified: 631") == 631
+    assert parse_verified_member_count(" verified : 1,024 ") == 1024
+    assert parse_verified_member_count("Verified: 12,34") is None
+    assert parse_verified_member_count("Members: 631") is None
     sample = {
         "id": "123456789",
         "guild_id": "987654321",

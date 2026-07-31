@@ -185,6 +185,10 @@ MODEL_CHAIN: tuple[tuple[str, str, str], ...] = (
 )
 SUMMARY_REPORT_TITLE = GENERIC_PROFILE.report_title
 SUMMARY_LANGUAGE = "zh-CN"
+MEMBER_STATS_NAME_PATTERN = re.compile(
+    r"^\s*Verified\s*:\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$",
+    re.IGNORECASE,
+)
 
 
 def configure_business_profile(env: dict[str, str]) -> tuple[BusinessProfile, str]:
@@ -373,6 +377,124 @@ def discord_api_get(token: str, path: str) -> Any:
             raise RuntimeError(f"无法连接 Discord API：{exc.reason}") from exc
 
     raise RuntimeError("Discord API 多次重试后仍然失败。")
+
+
+def parse_verified_member_count(channel_name: str) -> int | None:
+    """严格读取 ``Verified: 数字``，兼容空格和千分位逗号。"""
+    match = MEMBER_STATS_NAME_PATTERN.fullmatch(str(channel_name or ""))
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
+def member_stats_baseline(state: dict[str, Any]) -> int | None:
+    """读取上一次成功日报中的人数基线。"""
+    try:
+        count = int(state.get("member_stats_last_reported_count"))
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def member_stats_line(
+    *,
+    current_count: int | None,
+    previous_count: int | None,
+    available: bool,
+) -> str:
+    """生成日报中的单行人数信息。"""
+    if not available or current_count is None:
+        if previous_count is None:
+            return "👥 已验证成员：暂时无法读取｜暂无历史记录"
+        return (
+            "👥 已验证成员：暂时无法读取｜"
+            f"上次成功记录：{previous_count:,}"
+        )
+    if previous_count is None:
+        return f"👥 已验证成员：{current_count:,}｜首次记录"
+    difference = current_count - previous_count
+    difference_text = (
+        f"+{difference}" if difference > 0 else str(difference)
+    )
+    return (
+        f"👥 已验证成员：{current_count:,}｜"
+        f"较上次日报 {difference_text}"
+    )
+
+
+def commit_pending_member_stats(
+    state: dict[str, Any],
+    *,
+    committed_at: datetime,
+) -> None:
+    """只在整份日报发送成功后提交本次人数基线。"""
+    snapshot = state.get("pending_member_stats_snapshot")
+    if not isinstance(snapshot, dict) or snapshot.get("status") != "ok":
+        return
+    try:
+        count = int(snapshot.get("count"))
+    except (TypeError, ValueError):
+        return
+    if count < 0:
+        return
+    state["member_stats_last_reported_count"] = count
+    state["member_stats_last_reported_at"] = str(
+        snapshot.get("observed_at")
+        or committed_at.astimezone(timezone.utc).isoformat()
+    )
+
+
+def fetch_member_stats_snapshot(
+    *,
+    state: dict[str, Any],
+    env: dict[str, str],
+    token: str,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    """读取统计频道当前名称；失败只影响人数行，不阻断问题日报。"""
+    channel_id = str(
+        env.get("DISCORD_MEMBER_STATS_CHANNEL_ID") or ""
+    ).strip()
+    if not channel_id:
+        return {"status": "disabled", "line": ""}
+    previous_count = member_stats_baseline(state)
+    if not channel_id.isdigit():
+        return {
+            "status": "unavailable",
+            "line": member_stats_line(
+                current_count=None,
+                previous_count=previous_count,
+                available=False,
+            ),
+        }
+    try:
+        payload = discord_api_get(token, f"/channels/{channel_id}")
+        if not isinstance(payload, dict):
+            raise RuntimeError("统计频道返回了意外的数据格式。")
+        current_count = parse_verified_member_count(
+            str(payload.get("name") or "")
+        )
+        if current_count is None:
+            raise RuntimeError("统计频道名称不符合 Verified: 数字 格式。")
+    except RuntimeError:
+        return {
+            "status": "unavailable",
+            "line": member_stats_line(
+                current_count=None,
+                previous_count=previous_count,
+                available=False,
+            ),
+        }
+    return {
+        "status": "ok",
+        "count": current_count,
+        "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
+        "line": member_stats_line(
+            current_count=current_count,
+            previous_count=previous_count,
+            available=True,
+        ),
+    }
 
 
 def classify_author(
@@ -2743,6 +2865,7 @@ def build_daily_report(
     first_report_case_ids: set[str] | None = None,
     silently_closed_case_ids: set[str] | None = None,
     support_health: dict[str, str] | None = None,
+    member_stats_line_text: str = "",
 ) -> str:
     """由已校验案例生成确定性的 Telegram 日报。"""
     first_report_case_ids = first_report_case_ids or set()
@@ -2788,6 +2911,8 @@ def build_daily_report(
         f"本次确认解决：{len(resolved_today)}｜"
         f"暂时关闭：{len(silently_closed)}",
     ]
+    if member_stats_line_text:
+        lines.append(member_stats_line_text)
     if support_health and support_health.get("status") != "ok":
         warning = safe_public_text(
             support_health.get("warning"),
@@ -3059,6 +3184,7 @@ def clear_pending_report(state: dict[str, Any]) -> None:
             "pending_case_index": [],
             "pending_processed_message_ids": [],
             "pending_report_message_count": 0,
+            "pending_member_stats_snapshot": {},
             "pending_exclusion_revision": None,
             "pending_business_profile_digest": "",
         }
@@ -3145,6 +3271,7 @@ def mark_success(
             "last_ai_failures": [],
         }
     )
+    commit_pending_member_stats(state, committed_at=now)
     clear_pending_report(state)
     save_runtime_state(state)
 
@@ -3218,6 +3345,7 @@ def build_report_from_discord(
     int,
     list[str],
     int,
+    dict[str, Any],
 ]:
     """合并 Help API 与本地工单索引并生成日报；本函数不写状态。"""
     token = (
@@ -3229,6 +3357,12 @@ def build_report_from_discord(
         raise RuntimeError("配置中缺少 Discord Bot Token。")
     if not channel_id.isdigit():
         raise RuntimeError("配置中缺少有效的 DISCORD_MONITOR_CHANNEL_ID。")
+    member_stats_snapshot = fetch_member_stats_snapshot(
+        state=state,
+        env=env,
+        token=token,
+        observed_at=end_time,
+    )
 
     report_start = (
         end_time - timedelta(hours=manual_hours)
@@ -3336,7 +3470,15 @@ def build_report_from_discord(
             for item in analysis_messages
         )
         if has_required_users and not cases:
-            return [], [], [], 0, failures, exclusion_revision
+            return (
+                [],
+                [],
+                [],
+                0,
+                failures,
+                exclusion_revision,
+                member_stats_snapshot,
+            )
         active_cases = cases or active_cases
 
     # 再次清理，确保模型不会把旧案例无限延长。
@@ -3365,6 +3507,9 @@ def build_report_from_discord(
         first_report_case_ids=first_report_case_ids,
         silently_closed_case_ids=silently_closed_case_ids,
         support_health=support_health,
+        member_stats_line_text=str(
+            member_stats_snapshot.get("line") or ""
+        ),
     )
     parts = split_telegram_report(report)
     effective_user_messages = sum(
@@ -3379,6 +3524,7 @@ def build_report_from_discord(
         effective_user_messages,
         failures,
         exclusion_revision,
+        member_stats_snapshot,
     )
 
 
@@ -3502,6 +3648,7 @@ def run_scheduled_summary() -> None:
             message_count,
             failures,
             built_revision,
+            member_stats_snapshot,
         ) = build_report_from_discord(
             state=state,
             env=env,
@@ -3530,6 +3677,7 @@ def run_scheduled_summary() -> None:
                 "pending_case_index": cases,
                 "pending_processed_message_ids": processed_ids,
                 "pending_report_message_count": message_count,
+                "pending_member_stats_snapshot": member_stats_snapshot,
                 "pending_exclusion_revision": built_revision,
                 "pending_business_profile_digest": profile_digest,
             }
@@ -3665,6 +3813,7 @@ def run_preview(*, hours: float | None, send_test: bool) -> None:
         _count,
         failures,
         _exclusion_revision,
+        _member_stats_snapshot,
     ) = build_report_from_discord(
         state=state,
         env=env,
