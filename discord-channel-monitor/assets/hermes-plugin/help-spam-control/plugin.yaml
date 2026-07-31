@@ -1,0 +1,6 @@
+name: help-spam-control
+version: "1.0.0"
+description: Paired-owner Telegram reply controls for excluding Discord Help spam from daily reports.
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch

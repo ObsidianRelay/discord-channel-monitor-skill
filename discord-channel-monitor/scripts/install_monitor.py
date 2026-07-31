@@ -22,12 +22,20 @@ MONITOR_SOURCE = Path(__file__).resolve().parent / "monitor.py"
 HELP_DAILY_SOURCE = (
     Path(__file__).resolve().parent / "help_daily_summary_source.py"
 )
+BUSINESS_PROFILE_SOURCE = Path(__file__).resolve().parent / "business_profile.py"
+HELP_SPAM_STATE_SOURCE = Path(__file__).resolve().parent / "help_spam_state.py"
+HELP_SPAM_PLUGIN_SOURCE = (
+    SKILL_DIR / "assets" / "hermes-plugin" / "help-spam-control"
+)
 SUPPORT_OCR_SOURCE = (
     Path(__file__).resolve().parent / "support_vision_ocr.m"
 )
 REQUIREMENTS_FILE = SKILL_DIR / "requirements.txt"
 DEFAULT_SERVICE_DIR = Path.home() / ".hermes" / "services" / "discord-channel-monitor"
 DEFAULT_ENV_FILE = Path.home() / ".hermes" / "discord-channel-monitor.env"
+DEFAULT_HELP_SPAM_PLUGIN_DIR = (
+    Path.home() / ".hermes" / "plugins" / "help-spam-control"
+)
 DEFAULT_LAUNCH_AGENT = (
     Path.home() / "Library" / "LaunchAgents" / "local.discord-channel-monitor.plist"
 )
@@ -35,7 +43,6 @@ LAUNCH_AGENT_LABEL = "local.discord-channel-monitor"
 REQUIRED_CONFIG_KEYS = {
     "DISCORD_MONITOR_BOT_TOKEN",
     "DISCORD_MONITOR_CHANNEL_ID",
-    "DISCORD_SUPPORT_CATEGORY_ID",
 }
 CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -141,6 +148,8 @@ def render_env(config: dict[str, str]) -> str:
         "DISCORD_SUPPORT_CATEGORY_ID",
         "HERMES_NOTIFY_TARGET",
         "HERMES_HELP_COLLECTION_TARGET",
+        "HERMES_HELP_DAILY_SUMMARY_TARGET",
+        "HELP_COLLECTION_ENABLED",
         "HERMES_TICKET_NOTIFY_TARGET",
         "DISCORD_MONITOR_ROLE_IDS",
         "DISCORD_MONITOR_EXCLUDED_ROLE_IDS",
@@ -158,7 +167,14 @@ def render_env(config: dict[str, str]) -> str:
         "DISCORD_MONITOR_STATE_DIR",
         "DISCORD_TICKET_ROUTES_FILE",
         "DISCORD_TICKET_EVENT_FILE",
+        "DISCORD_TICKET_MESSAGE_STATE_FILE",
         "DISCORD_SUPPORT_MESSAGE_STATE_FILE",
+        "HERMES_MONITOR_BUSINESS_PROFILE",
+        "HERMES_MONITOR_BUSINESS_PROFILE_REQUIRED",
+        "HERMES_SUMMARY_MODEL_CHAIN_JSON",
+        "HERMES_SUMMARY_LANGUAGE",
+        "HERMES_HELP_SPAM_ALIASES",
+        "HERMES_HELP_RESTORE_ALIASES",
     ]
     ordered_keys = [key for key in preferred_order if key in config]
     ordered_keys.extend(sorted(set(config) - set(ordered_keys)))
@@ -274,10 +290,6 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
         "DISCORD_MONITOR_CHANNEL_ID",
         input("要监控的 Discord 频道 ID: "),
     )
-    support_category_id = validate_discord_id(
-        "DISCORD_SUPPORT_CATEGORY_ID",
-        input("Support 工单分类 ID（用于只读采集正文和截图）: "),
-    )
     notify_target = validate_single_line(
         "HERMES_NOTIFY_TARGET",
         input("Hermes 通知目标 [telegram]: ") or "telegram",
@@ -316,7 +328,6 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
     return {
         "DISCORD_MONITOR_BOT_TOKEN": token,
         "DISCORD_MONITOR_CHANNEL_ID": channel_id,
-        "DISCORD_SUPPORT_CATEGORY_ID": support_category_id,
         "HERMES_NOTIFY_TARGET": notify_target,
         "HERMES_HELP_COLLECTION_TARGET": help_target,
         "HERMES_TICKET_NOTIFY_TARGET": ticket_target,
@@ -338,8 +349,8 @@ def collect_new_config(hermes_bin: Path, service_dir: Path) -> dict[str, str]:
         "DISCORD_TICKET_EVENT_FILE": str(
             service_dir / "data" / "ticket-events.jsonl"
         ),
-        "DISCORD_SUPPORT_MESSAGE_STATE_FILE": str(
-            service_dir / "data" / "support-message-state.json"
+        "DISCORD_TICKET_MESSAGE_STATE_FILE": str(
+            service_dir / "data" / "ticket-message-state.json"
         ),
     }
 
@@ -348,7 +359,7 @@ def print_plan() -> None:
     print("安装计划（本次仅预览，不会执行）：")
     print(f"1. 检查 Hermes、Python 和源文件：{SKILL_DIR}")
     print(f"2. 创建独立运行目录：{DEFAULT_SERVICE_DIR}")
-    print("3. 复制监听器、Help 日报脚本和 Support OCR 源码")
+    print("3. 复制监听器、通用适配器、日报脚本、垃圾控制插件和通用 OCR 源码")
     print("4. 使用 macOS clang + Apple Vision 构建本地 OCR 辅助程序")
     print(f"5. 创建虚拟环境并安装：{REQUIREMENTS_FILE}")
     print(f"6. 写入受保护配置：{DEFAULT_ENV_FILE}（权限 600）")
@@ -371,6 +382,15 @@ def check_installation() -> int:
     checks.append(("监控源文件", MONITOR_SOURCE.is_file(), str(MONITOR_SOURCE)))
     checks.append(
         ("Help 日报源文件", HELP_DAILY_SOURCE.is_file(), str(HELP_DAILY_SOURCE))
+    )
+    checks.append(
+        ("通用业务适配器", BUSINESS_PROFILE_SOURCE.is_file(), str(BUSINESS_PROFILE_SOURCE))
+    )
+    checks.append(
+        ("Help 垃圾状态模块", HELP_SPAM_STATE_SOURCE.is_file(), str(HELP_SPAM_STATE_SOURCE))
+    )
+    checks.append(
+        ("Help 垃圾控制插件", HELP_SPAM_PLUGIN_SOURCE.is_dir(), str(HELP_SPAM_PLUGIN_SOURCE))
     )
     checks.append(
         ("Support OCR 源码", SUPPORT_OCR_SOURCE.is_file(), str(SUPPORT_OCR_SOURCE))
@@ -411,11 +431,19 @@ def check_installation() -> int:
     )
     runtime_monitor = DEFAULT_SERVICE_DIR / "monitor.py"
     runtime_help_daily = DEFAULT_SERVICE_DIR / "help_daily_summary_source.py"
+    runtime_business_profile = DEFAULT_SERVICE_DIR / "business_profile.py"
+    runtime_spam_state = DEFAULT_SERVICE_DIR / "help_spam_state.py"
     runtime_ocr_helper = DEFAULT_SERVICE_DIR / "bin" / "support_vision_ocr"
     venv_python = DEFAULT_SERVICE_DIR / "venv" / "bin" / "python"
     checks.append(("运行副本", runtime_monitor.is_file(), str(runtime_monitor)))
     checks.append(
         ("Help 日报运行副本", runtime_help_daily.is_file(), str(runtime_help_daily))
+    )
+    checks.append(
+        ("通用适配器运行副本", runtime_business_profile.is_file(), str(runtime_business_profile))
+    )
+    checks.append(
+        ("垃圾状态运行副本", runtime_spam_state.is_file(), str(runtime_spam_state))
     )
     checks.append(
         (
@@ -448,7 +476,6 @@ def run_self_test() -> int:
     fake_config = {
         "DISCORD_MONITOR_BOT_TOKEN": "example-token-never-use",
         "DISCORD_MONITOR_CHANNEL_ID": "100000000000000002",
-        "DISCORD_SUPPORT_CATEGORY_ID": "100000000000000003",
         "HERMES_NOTIFY_TARGET": "telegram",
     }
     env_text = render_env(fake_config)
@@ -485,6 +512,9 @@ def install() -> int:
     if (
         not MONITOR_SOURCE.is_file()
         or not HELP_DAILY_SOURCE.is_file()
+        or not BUSINESS_PROFILE_SOURCE.is_file()
+        or not HELP_SPAM_STATE_SOURCE.is_file()
+        or not HELP_SPAM_PLUGIN_SOURCE.is_dir()
         or not SUPPORT_OCR_SOURCE.is_file()
         or not REQUIREMENTS_FILE.is_file()
     ):
@@ -510,14 +540,9 @@ def install() -> int:
         config["DISCORD_TICKET_EVENT_FILE"] = str(
             DEFAULT_SERVICE_DIR / "data" / "ticket-events.jsonl"
         )
-        config["DISCORD_SUPPORT_MESSAGE_STATE_FILE"] = str(
-            DEFAULT_SERVICE_DIR / "data" / "support-message-state.json"
+        config["DISCORD_TICKET_MESSAGE_STATE_FILE"] = str(
+            DEFAULT_SERVICE_DIR / "data" / "ticket-message-state.json"
         )
-        if not config.get("DISCORD_SUPPORT_CATEGORY_ID", "").strip():
-            config["DISCORD_SUPPORT_CATEGORY_ID"] = validate_discord_id(
-                "DISCORD_SUPPORT_CATEGORY_ID",
-                input("Support 工单分类 ID（用于只读采集正文和截图）: "),
-            )
         config.setdefault("SUPPORT_OCR_ENABLED", "true")
         config.setdefault("SUPPORT_OCR_MAX_IMAGES", "3")
         config.setdefault("SUPPORT_OCR_MAX_BYTES", "8388608")
@@ -561,6 +586,8 @@ def install() -> int:
         DEFAULT_ENV_FILE,
         DEFAULT_SERVICE_DIR / "monitor.py",
         DEFAULT_SERVICE_DIR / "help_daily_summary_source.py",
+        DEFAULT_SERVICE_DIR / "business_profile.py",
+        DEFAULT_SERVICE_DIR / "help_spam_state.py",
         DEFAULT_SERVICE_DIR / "bin" / "support_vision_ocr",
         DEFAULT_LAUNCH_AGENT,
     ):
@@ -587,6 +614,27 @@ def install() -> int:
     temp_help_daily.chmod(0o700)
     temp_help_daily.replace(runtime_help_daily)
 
+    for source, destination in (
+        (BUSINESS_PROFILE_SOURCE, DEFAULT_SERVICE_DIR / "business_profile.py"),
+        (HELP_SPAM_STATE_SOURCE, DEFAULT_SERVICE_DIR / "help_spam_state.py"),
+    ):
+        temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+        shutil.copy2(source, temporary)
+        temporary.chmod(0o600)
+        temporary.replace(destination)
+
+    DEFAULT_HELP_SPAM_PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_HELP_SPAM_PLUGIN_DIR.chmod(0o700)
+    for name in ("__init__.py", "controller.py", "plugin.yaml"):
+        destination = DEFAULT_HELP_SPAM_PLUGIN_DIR / name
+        backup = backup_file(destination)
+        if backup:
+            print(f"已备份：{backup}")
+        temporary = destination.with_name(f".{name}.tmp-{os.getpid()}")
+        shutil.copy2(HELP_SPAM_PLUGIN_SOURCE / name, temporary)
+        temporary.chmod(0o600)
+        temporary.replace(destination)
+
     runtime_ocr_helper = DEFAULT_SERVICE_DIR / "bin" / "support_vision_ocr"
     temp_ocr_helper = DEFAULT_SERVICE_DIR / "bin" / (
         f".support_vision_ocr.tmp-{os.getpid()}"
@@ -603,6 +651,14 @@ def install() -> int:
     routes_file = DEFAULT_SERVICE_DIR / "ticket-routes.json"
     if not routes_file.exists():
         safe_write_text(routes_file, "{}\n", 0o600)
+    legacy_state = DEFAULT_SERVICE_DIR / "data" / "support-message-state.json"
+    ticket_state = DEFAULT_SERVICE_DIR / "data" / "ticket-message-state.json"
+    if legacy_state.is_file() and not ticket_state.exists():
+        backup = backup_file(legacy_state)
+        shutil.copy2(legacy_state, ticket_state)
+        ticket_state.chmod(0o600)
+        if backup:
+            print(f"旧 Support 索引已备份并迁移：{backup}")
 
     plist_bytes = render_launch_agent(
         venv_dir / "bin" / "python",
@@ -633,6 +689,7 @@ def install() -> int:
         print("后台服务已加载。请运行 --check，并通过获批的真实消息确认端到端通知。")
     else:
         print("文件已安装，但服务尚未加载或启动。")
+    print("垃圾控制插件已更新；如需立即生效，请单独确认后重启 Hermes Gateway。")
     return 0
 
 

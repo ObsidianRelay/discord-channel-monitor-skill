@@ -1,6 +1,6 @@
 ---
 name: discord-channel-monitor
-description: Configure, validate, diagnose, and safely operate a macOS Discord Gateway monitor that forwards allowlisted Help messages and Support or Collaboration ticket events through Hermes to Telegram, including delayed unanswered-message alerts, sleep recovery, a scheduled Help and Support feedback summary, and optional local Apple Vision OCR for Support screenshots. Use when Codex needs to install the monitor, check status, inspect logs, test alerts, update routing, verify the Help summary, extract order or logistics fields from Support screenshots, or troubleshoot disconnects. Keep Discord actions read-only and require explicit approval before installing, changing configuration, scheduling summaries, or changing service state.
+description: Configure, validate, diagnose, and safely operate a macOS Discord Gateway monitor that forwards allowlisted Help messages and configurable ticket events through Hermes, including delayed unanswered-message alerts, sleep recovery, scheduled cross-day feedback summaries, generic local OCR, and reply-based spam exclusion. Use when Codex needs to install the monitor, check status, inspect logs, test alerts, update ticket routing, verify summaries, or troubleshoot disconnects. Keep Discord actions read-only and require explicit approval before installing, changing configuration, scheduling summaries, or changing service state.
 ---
 
 # Discord Channel Monitor
@@ -54,12 +54,12 @@ The installer stores runtime files outside the Skill directory, protects the env
 - Store ticket statistics with minimum metadata only; never persist message bodies.
 - Keep pending Help alerts and cached daily reports only in the protected runtime
   directory. Never copy those state files into the Skill repository.
-- Download only allowlisted Discord image attachments for Support OCR. Keep each
+- Download only allowlisted Discord image attachments for generic ticket OCR. Keep each
   temporary image private, delete it after processing, and never send the image
   or complete OCR text to an external model.
 - Do not call an AI model when the reporting interval contains zero eligible messages.
-- Keep the daily model order `OnlyRouter → GonkaRouter → DeepSeek`, with a
-  60-second timeout per model and retry only after a later full wake when all fail.
+- Use the configured model list, or the active Hermes default when none is set.
+  Keep a 60-second timeout per model and retry after a later full wake when all fail.
 - Stop and warn the user if a token or other credential appears in a repository, terminal output, or log.
 
 ## Included resources
@@ -67,6 +67,9 @@ The installer stores runtime files outside the Skill directory, protects the env
 - `scripts/monitor.py`: Discord Gateway listener and Hermes notification worker.
 - `scripts/help_daily_summary_source.py`: deterministic Help collection,
   10:00 scheduling, wake recovery, model fallback, and Telegram delivery cache.
+- `scripts/business_profile.py`: public adapter API and generic categories.
+- `scripts/help_spam_state.py`: ID-only spam exclusion and restore state.
+- `assets/hermes-plugin/help-spam-control/`: paired-user Telegram reply commands.
 - `scripts/support_vision_ocr.m`: local macOS Apple Vision OCR helper source.
 - `scripts/install_monitor.py`: read-only checks, dry-run planning, interactive secure installation, and LaunchAgent setup.
 - `requirements.txt`: runtime Python dependency constraints.
