@@ -1118,10 +1118,16 @@ def filter_ticket_scope(
         if conversation_id:
             conversations.setdefault(conversation_id, []).append(message)
 
+    user_conversation_ids = {
+        conversation_id
+        for conversation_id, items in conversations.items()
+        if any(item.get("author_kind") == "user" for item in items)
+    }
     new_conversation_ids = {
         conversation_id
         for conversation_id, items in conversations.items()
-        if any(bool(item.get("is_new")) for item in items)
+        if conversation_id in user_conversation_ids
+        and any(bool(item.get("is_new")) for item in items)
     }
     excluded_conversation_ids: set[str] = set()
     review_count = 0
@@ -1131,6 +1137,8 @@ def filter_ticket_scope(
         )
         if decision == "exclude_fulfillment":
             excluded_conversation_ids.add(conversation_id)
+        elif conversation_id not in user_conversation_ids:
+            continue
         elif decision not in {"include", "review"}:
             review_count += 1
         elif decision == "review":
@@ -1156,6 +1164,16 @@ def filter_ticket_scope(
         ),
         "scope_review_count": review_count,
         "excluded_message_ids": excluded_message_ids,
+        "ticket_conversation_message_ids": {
+            conversation_id: [
+                str(item.get("id") or "")
+                for item in items
+                if str(item.get("id") or "").isdigit()
+            ]
+            for conversation_id, items in conversations.items()
+            if conversation_id in user_conversation_ids
+        },
+        "excluded_conversation_ids": sorted(excluded_conversation_ids),
     }
 
 
@@ -3609,20 +3627,6 @@ def build_report_from_discord(
         for item in (support_health.get("excluded_message_ids") or [])
         if str(item).isdigit()
     ]
-    ticket_filter_stats = {
-        "ticket_count": max(
-            0,
-            int(support_health.get("ticket_count") or 0),
-        ),
-        "excluded_fulfillment_count": max(
-            0,
-            int(support_health.get("excluded_fulfillment_count") or 0),
-        ),
-        "scope_review_count": max(
-            0,
-            int(support_health.get("scope_review_count") or 0),
-        ),
-    }
     all_messages = sorted(
         [*help_messages, *support_messages],
         key=lambda item: item["sort_time"],
@@ -3680,6 +3684,46 @@ def build_report_from_discord(
         if message_id not in active_excluded_ids
     ]
     processed_set = set(processed_ids)
+    raw_ticket_conversations = support_health.get(
+        "ticket_conversation_message_ids"
+    )
+    ticket_conversations = (
+        raw_ticket_conversations
+        if isinstance(raw_ticket_conversations, dict)
+        else {}
+    )
+    pending_ticket_conversations = {
+        str(conversation_id)
+        for conversation_id, raw_ids in ticket_conversations.items()
+        if isinstance(raw_ids, list)
+        and any(
+            str(message_id).isdigit()
+            and str(message_id) not in processed_set
+            for message_id in raw_ids
+        )
+    }
+    excluded_conversations = {
+        str(item)
+        for item in (
+            support_health.get("excluded_conversation_ids") or []
+        )
+        if str(item)
+    }
+    support_health["ticket_count"] = len(pending_ticket_conversations)
+    support_health["excluded_fulfillment_count"] = len(
+        pending_ticket_conversations & excluded_conversations
+    )
+    support_health["scope_review_count"] = max(
+        0,
+        len(pending_ticket_conversations - excluded_conversations),
+    )
+    ticket_filter_stats = {
+        "ticket_count": int(support_health["ticket_count"]),
+        "excluded_fulfillment_count": int(
+            support_health["excluded_fulfillment_count"]
+        ),
+        "scope_review_count": int(support_health["scope_review_count"]),
+    }
     analysis_messages = [
         item
         for item in messages
