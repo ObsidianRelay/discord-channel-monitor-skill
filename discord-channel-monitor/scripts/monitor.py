@@ -44,6 +44,9 @@ DISCORD_API_BASE = "https://discord.com/api/v10"
 TICKET_EVENT_FILE = BASE_DIR / "data" / "ticket-events.jsonl"
 TICKET_ROUTES_FILE = BASE_DIR / "ticket-routes.json"
 PENDING_MESSAGE_FILE = BASE_DIR / "data" / "pending-message-alerts.json"
+TICKET_NOTIFICATION_OUTBOX_FILE = (
+    BASE_DIR / "data" / "ticket-notification-outbox.json"
+)
 HELP_MESSAGE_STATE_FILE = BASE_DIR / "data" / "help-message-state.json"
 TICKET_MESSAGE_STATE_FILE = BASE_DIR / "data" / "ticket-message-state.json"
 MEMBER_STATS_STATE_FILE = BASE_DIR / "data" / "member-stats-state.json"
@@ -54,6 +57,8 @@ SUPPORT_OCR_HELPER = BASE_DIR / "bin" / "support_vision_ocr"
 DEFAULT_TICKET_RECONCILE_INTERVAL_SECONDS = 60.0
 DEFAULT_MESSAGE_NOTIFY_DELAY_SECONDS = 300.0
 PENDING_MESSAGE_CHECK_INTERVAL_SECONDS = 5.0
+TICKET_NOTIFICATION_CHECK_INTERVAL_SECONDS = 5.0
+TICKET_NOTIFICATION_MAX_RETRY_SECONDS = 15 * 60.0
 DEFAULT_HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS = 30.0
 DEFAULT_MEMBER_STATS_RECONCILE_INTERVAL_SECONDS = 300.0
 HELP_COLLECTION_CHECK_INTERVAL_SECONDS = 5.0
@@ -217,7 +222,8 @@ def configure_runtime(config: dict[str, str]) -> None:
     """应用可公开的运行路径覆盖，不读取或打印任何凭据值。"""
     global HERMES_BIN
     global TICKET_EVENT_FILE, TICKET_ROUTES_FILE
-    global PENDING_MESSAGE_FILE, HELP_MESSAGE_STATE_FILE
+    global PENDING_MESSAGE_FILE, TICKET_NOTIFICATION_OUTBOX_FILE
+    global HELP_MESSAGE_STATE_FILE
     global TICKET_MESSAGE_STATE_FILE, MEMBER_STATS_STATE_FILE
     global LEGACY_SUPPORT_MESSAGE_STATE_FILE
     global SUPPORT_OCR_HELPER
@@ -251,6 +257,11 @@ def configure_runtime(config: dict[str, str]) -> None:
         config,
         "DISCORD_PENDING_MESSAGE_FILE",
         state_dir / "data" / "pending-message-alerts.json",
+    )
+    TICKET_NOTIFICATION_OUTBOX_FILE = configured_path(
+        config,
+        "DISCORD_TICKET_NOTIFICATION_OUTBOX_FILE",
+        state_dir / "data" / "ticket-notification-outbox.json",
     )
     HELP_MESSAGE_STATE_FILE = configured_path(
         config,
@@ -403,6 +414,102 @@ def load_recorded_ticket_guild_ids() -> set[str]:
         if guild_id.isdigit() and category_id:
             guild_ids.add(guild_id)
     return guild_ids
+
+
+def timestamped_log(message: str, *, error: bool = False) -> None:
+    """为关键扫描日志增加本机时间，不输出消息正文或 Discord ID。"""
+    stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    print(
+        f"[{stamp}] {message}",
+        file=sys.stderr if error else sys.stdout,
+        flush=True,
+    )
+
+
+def safe_log_error(exc: BaseException) -> str:
+    """保留错误类型和短原因，同时移除链接、账号和长数字标识。"""
+    text = str(exc).replace("\x00", " ")
+    text = SUPPORT_URL_PATTERN.sub("[链接已隐藏]", text)
+    text = SUPPORT_EMAIL_PATTERN.sub("[邮箱已隐藏]", text)
+    text = SUPPORT_PHONE_PATTERN.sub("[号码已隐藏]", text)
+    text = SUPPORT_HANDLE_PATTERN.sub("[账号已隐藏]", text)
+    text = SUPPORT_LONG_ID_PATTERN.sub("[ID已隐藏]", text)
+    text = re.sub(r"\s+", " ", text).strip()[:160]
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def ticket_notification_retry_delay(attempt_count: int) -> float:
+    """通知失败后从一分钟开始指数退避，最长十五分钟。"""
+    safe_attempt = max(1, int(attempt_count))
+    return min(
+        60.0 * (2 ** min(safe_attempt - 1, 4)),
+        TICKET_NOTIFICATION_MAX_RETRY_SECONDS,
+    )
+
+
+def load_ticket_notification_outbox() -> dict[str, dict[str, Any]]:
+    """恢复尚未成功的工单提醒；不保存任何工单消息正文。"""
+    if not TICKET_NOTIFICATION_OUTBOX_FILE.exists():
+        return {}
+    try:
+        raw_data = json.loads(
+            TICKET_NOTIFICATION_OUTBOX_FILE.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw_data, dict):
+        return {}
+
+    outbox: dict[str, dict[str, Any]] = {}
+    for key, raw_item in raw_data.items():
+        if not isinstance(raw_item, dict):
+            continue
+        channel_id = str(raw_item.get("channel_id") or key)
+        guild_id = str(raw_item.get("guild_id") or "")
+        category_id = str(raw_item.get("category_id") or "")
+        target = str(raw_item.get("target") or "").strip()
+        alert = str(raw_item.get("alert") or "").strip()
+        if not (
+            channel_id.isdigit()
+            and guild_id.isdigit()
+            and category_id.isdigit()
+            and target
+            and alert
+        ):
+            continue
+        try:
+            attempt_count = max(0, int(raw_item.get("attempt_count") or 0))
+            next_attempt_at = max(
+                0.0,
+                float(raw_item.get("next_attempt_at") or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+        outbox[channel_id] = {
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "category_id": category_id,
+            "channel_name": str(raw_item.get("channel_name") or "")[:100],
+            "route_label": str(
+                raw_item.get("route_label") or "Ticket"
+            )[:100],
+            "owner": str(raw_item.get("owner") or "")[:100],
+            "target": target,
+            "alert": alert,
+            "detection_source": (
+                "reconciliation"
+                if str(raw_item.get("detection_source") or "")
+                == "reconciliation"
+                else "gateway"
+            ),
+            "created_at": str(raw_item.get("created_at") or ""),
+            "sent_at": str(raw_item.get("sent_at") or ""),
+            "attempt_count": attempt_count,
+            "next_attempt_at": next_attempt_at,
+        }
+    return outbox
 
 
 def load_pending_message_alerts() -> dict[str, dict[str, Any]]:
@@ -1128,10 +1235,14 @@ def normalize_support_ocr_state(raw_ocr: Any) -> dict[str, Any] | None:
 def load_support_message_state() -> dict[str, Any]:
     """读取通用工单索引；首次运行可从旧 Support 状态无损迁移。"""
     empty_state: dict[str, Any] = {
-        "version": 4,
+        "version": 5,
         "channels": {},
         "messages": [],
         "channel_errors": {},
+        "last_scan_started_at": "",
+        "last_scan_completed_at": "",
+        "last_scan_daily_channels": 0,
+        "last_scan_daily_errors": 0,
         "last_success_at": "",
         "last_error": "",
         "last_error_at": "",
@@ -1262,8 +1373,21 @@ def load_support_message_state() -> dict[str, Any]:
         )
     messages.sort(key=lambda item: int(item["id"]))
 
+    try:
+        last_scan_daily_channels = max(
+            0,
+            int(raw_state.get("last_scan_daily_channels") or 0),
+        )
+        last_scan_daily_errors = max(
+            0,
+            int(raw_state.get("last_scan_daily_errors") or 0),
+        )
+    except (TypeError, ValueError):
+        last_scan_daily_channels = 0
+        last_scan_daily_errors = 0
+
     state = {
-        "version": 4,
+        "version": 5,
         "channels": channels,
         "messages": messages,
         "channel_errors": {
@@ -1273,6 +1397,14 @@ def load_support_message_state() -> dict[str, Any]:
             ).items()
             if str(channel_id).isdigit() and str(error).strip()
         },
+        "last_scan_started_at": str(
+            raw_state.get("last_scan_started_at") or ""
+        ),
+        "last_scan_completed_at": str(
+            raw_state.get("last_scan_completed_at") or ""
+        ),
+        "last_scan_daily_channels": last_scan_daily_channels,
+        "last_scan_daily_errors": last_scan_daily_errors,
         "last_success_at": str(raw_state.get("last_success_at") or ""),
         "last_error": str(raw_state.get("last_error") or "")[:500],
         "last_error_at": str(raw_state.get("last_error_at") or ""),
@@ -1867,6 +1999,9 @@ class DiscordChannelMonitor:
         self.recent_ticket_channel_ids: deque[str] = deque(maxlen=500)
         self.recent_ticket_channel_id_set: set[str] = set()
         self.recorded_ticket_channel_ids = load_recorded_ticket_channel_ids()
+        self.ticket_notification_outbox = load_ticket_notification_outbox()
+        self.ticket_notification_lock = asyncio.Lock()
+        self.ticket_notification_wakeup = asyncio.Event()
         self.pending_message_alerts = load_pending_message_alerts()
         self.pending_message_lock = asyncio.Lock()
         self.pending_message_wakeup = asyncio.Event()
@@ -1911,6 +2046,7 @@ class DiscordChannelMonitor:
         if (
             not channel_id
             or channel_id in self.recorded_ticket_channel_ids
+            or channel_id in self.ticket_notification_outbox
             or channel_id in self.recent_ticket_channel_id_set
         ):
             return False
@@ -1926,6 +2062,169 @@ class DiscordChannelMonitor:
         self.recent_ticket_channel_id_set.discard(channel_id)
         with contextlib.suppress(ValueError):
             self.recent_ticket_channel_ids.remove(channel_id)
+
+    def save_ticket_notification_outbox(self) -> None:
+        """原子保存工单提醒队列；队列不包含用户消息正文。"""
+        TICKET_NOTIFICATION_OUTBOX_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        temporary_file = TICKET_NOTIFICATION_OUTBOX_FILE.with_suffix(
+            ".json.tmp"
+        )
+        temporary_file.write_text(
+            json.dumps(
+                self.ticket_notification_outbox,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary_file.chmod(0o600)
+        temporary_file.replace(TICKET_NOTIFICATION_OUTBOX_FILE)
+
+    async def queue_ticket_notification(
+        self,
+        payload: dict[str, Any],
+        route: dict[str, Any],
+        *,
+        catch_up: bool,
+        detection_source: str,
+    ) -> bool:
+        """持久化工单提醒后立即返回，绝不等待 Telegram 网络。"""
+        channel_id = str(payload.get("id") or "")
+        guild_id = str(payload.get("guild_id") or self.ticket_guild_id)
+        category_id = str(payload.get("parent_id") or "")
+        if not (
+            channel_id.isdigit()
+            and guild_id.isdigit()
+            and category_id.isdigit()
+        ):
+            raise RuntimeError("新工单提醒缺少有效的 Discord 标识。")
+        async with self.ticket_notification_lock:
+            if (
+                channel_id in self.recorded_ticket_channel_ids
+                or channel_id in self.ticket_notification_outbox
+            ):
+                return False
+            target = str(
+                route.get("target") or self.ticket_default_target
+            ).strip()
+            self.ticket_notification_outbox[channel_id] = {
+                "channel_id": channel_id,
+                "guild_id": guild_id,
+                "category_id": category_id,
+                "channel_name": str(payload.get("name") or "")[:100],
+                "route_label": str(route.get("label") or "Ticket")[:100],
+                "owner": str(route.get("owner") or "")[:100],
+                "target": target,
+                "alert": build_ticket_alert(
+                    payload,
+                    route,
+                    catch_up=catch_up,
+                ),
+                "detection_source": (
+                    "reconciliation"
+                    if detection_source == "reconciliation"
+                    else "gateway"
+                ),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "sent_at": "",
+                "attempt_count": 0,
+                "next_attempt_at": 0.0,
+            }
+            self.save_ticket_notification_outbox()
+        self.ticket_notification_wakeup.set()
+        timestamped_log(
+            "新工单已进入持久化 Telegram 通知队列："
+            f"{str(route.get('label') or 'Ticket')[:100]}"
+        )
+        return True
+
+    async def process_ticket_notification_outbox(self) -> int:
+        """发送到期提醒；失败只调整重试时间，不影响 Discord 采集。"""
+        now = time.time()
+        async with self.ticket_notification_lock:
+            due_items = [
+                (channel_id, dict(item))
+                for channel_id, item in self.ticket_notification_outbox.items()
+                if float(item.get("next_attempt_at") or 0) <= now
+            ]
+
+        sent_count = 0
+        for channel_id, item in due_items:
+            try:
+                if not str(item.get("sent_at") or ""):
+                    async with self.hermes_send_lock:
+                        await send_via_hermes(
+                            str(item["target"]),
+                            str(item["alert"]),
+                            attempts=1,
+                        )
+                    async with self.ticket_notification_lock:
+                        current = self.ticket_notification_outbox.get(channel_id)
+                        if current:
+                            current["sent_at"] = datetime.now(
+                                timezone.utc
+                            ).isoformat()
+                            self.save_ticket_notification_outbox()
+
+                if channel_id not in self.recorded_ticket_channel_ids:
+                    record_ticket_event(
+                        {
+                            "id": channel_id,
+                            "guild_id": item["guild_id"],
+                            "name": item.get("channel_name") or "",
+                            "parent_id": item["category_id"],
+                        },
+                        {
+                            "label": item.get("route_label") or "Ticket",
+                            "owner": item.get("owner") or "",
+                        },
+                        detection_source=str(
+                            item.get("detection_source") or "gateway"
+                        ),
+                    )
+                    self.recorded_ticket_channel_ids.add(channel_id)
+                async with self.ticket_notification_lock:
+                    self.ticket_notification_outbox.pop(channel_id, None)
+                    self.save_ticket_notification_outbox()
+                self.forget_recent_ticket_channel(channel_id)
+                timestamped_log(
+                    "工单 Telegram 提醒发送成功："
+                    f"{str(item.get('route_label') or 'Ticket')[:100]}"
+                )
+                sent_count += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt_count = int(item.get("attempt_count") or 0) + 1
+                delay = ticket_notification_retry_delay(attempt_count)
+                async with self.ticket_notification_lock:
+                    current = self.ticket_notification_outbox.get(channel_id)
+                    if current:
+                        current["attempt_count"] = attempt_count
+                        current["next_attempt_at"] = time.time() + delay
+                        self.save_ticket_notification_outbox()
+                timestamped_log(
+                    "工单 Telegram 提醒发送失败，"
+                    f"{round(delay)} 秒后重试：{type(exc).__name__}",
+                    error=True,
+                )
+        return sent_count
+
+    async def ticket_notification_outbox_loop(self) -> None:
+        """独立处理工单提醒，确保发送超时不会阻塞工单扫描。"""
+        while not self.stop_event.is_set():
+            await self.process_ticket_notification_outbox()
+            self.ticket_notification_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self.ticket_notification_wakeup.wait(),
+                    timeout=TICKET_NOTIFICATION_CHECK_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     def save_pending_message_alerts(self) -> None:
         """原子保存待确认消息；内容不落盘，仅保存 Discord ID 和到期时间。"""
@@ -1978,10 +2277,9 @@ class DiscordChannelMonitor:
             message_count = len(pending["message_ids"])
 
         delay_minutes = max(1, round(self.message_notify_delay_seconds / 60))
-        print(
+        timestamped_log(
             f"消息进入 {delay_minutes} 分钟待确认队列："
-            f"Discord 消息 {message_id} / 已合并 {message_count} 条",
-            flush=True,
+            f"已合并 {message_count} 条"
         )
         if wake_pending_loop:
             self.pending_message_wakeup.set()
@@ -2004,11 +2302,8 @@ class DiscordChannelMonitor:
             if cancelled_keys:
                 self.save_pending_message_alerts()
 
-        for pending_key in cancelled_keys:
-            print(
-                f"工作人员已回复，取消 Telegram 提醒：{pending_key}",
-                flush=True,
-            )
+        for _pending_key in cancelled_keys:
+            timestamped_log("工作人员已回复，取消一组 Telegram 提醒。")
 
     async def has_staff_response_via_api(
         self,
@@ -2075,9 +2370,8 @@ class DiscordChannelMonitor:
                             ):
                                 self.pending_message_alerts.pop(pending_key, None)
                                 self.save_pending_message_alerts()
-                        print(
-                            f"复查到工作人员已回复，取消 Telegram 提醒：{pending_key}",
-                            flush=True,
+                        timestamped_log(
+                            "复查到工作人员已回复，取消一组 Telegram 提醒。"
                         )
                         continue
 
@@ -2132,11 +2426,10 @@ class DiscordChannelMonitor:
                         )
                     except Exception as mapping_exc:
                         # 通知已经成功送达，不能为了本地索引失败而重复推送。
-                        print(
+                        timestamped_log(
                             "Help 提醒已发送，但垃圾控制映射保存失败："
-                            f"{pending_key} / {mapping_exc}",
-                            file=sys.stderr,
-                            flush=True,
+                            f"{safe_log_error(mapping_exc)}",
+                            error=True,
                         )
 
                     async with self.pending_message_lock:
@@ -2146,9 +2439,8 @@ class DiscordChannelMonitor:
                         ):
                             self.pending_message_alerts.pop(pending_key, None)
                             self.save_pending_message_alerts()
-                    print(
-                        f"等待期结束且无人回复，已发送 Telegram：{pending_key}",
-                        flush=True,
+                    timestamped_log(
+                        "等待期结束且无人回复，已发送一组 Telegram 提醒。"
                     )
                     processed_count += 1
                 except asyncio.CancelledError:
@@ -2162,10 +2454,9 @@ class DiscordChannelMonitor:
                             else:
                                 current["next_attempt_at"] = time.time() + 60
                             self.save_pending_message_alerts()
-                    print(
-                        f"延迟消息处理失败：{pending_key} / {exc}",
-                        file=sys.stderr,
-                        flush=True,
+                    timestamped_log(
+                        f"延迟消息处理失败：{safe_log_error(exc)}",
+                        error=True,
                     )
         return processed_count
 
@@ -2274,10 +2565,9 @@ class DiscordChannelMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(
-                    f"已验证成员人数读取失败：{exc}",
-                    file=sys.stderr,
-                    flush=True,
+                timestamped_log(
+                    f"已验证成员人数读取失败：{safe_log_error(exc)}",
+                    error=True,
                 )
             try:
                 await asyncio.wait_for(
@@ -2337,7 +2627,7 @@ class DiscordChannelMonitor:
         """原子保存已脱敏的通用工单索引，并保留旧文件作为迁移备份。"""
         self.prune_support_message_state()
         refresh_support_error_summary(self.support_message_state)
-        self.support_message_state["version"] = 4
+        self.support_message_state["version"] = 5
         TICKET_MESSAGE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         temporary_file = TICKET_MESSAGE_STATE_FILE.with_suffix(".json.tmp")
         temporary_file.write_text(
@@ -2649,12 +2939,10 @@ class DiscordChannelMonitor:
                         retry_items.append(item)
                     else:
                         terminal_failure_count += 1
-                    print(
+                    timestamped_log(
                         "Support OCR 图片处理失败："
-                        f"{message_id} / {type(exc).__name__} / "
-                        f"{str(exc)[:80]}",
-                        file=sys.stderr,
-                        flush=True,
+                        f"{safe_log_error(exc)}",
+                        error=True,
                     )
                 finally:
                     with contextlib.suppress(OSError):
@@ -2788,11 +3076,10 @@ class DiscordChannelMonitor:
             self.save_support_message_state()
 
         if not retry_required:
-            print(
+            timestamped_log(
                 "Support OCR 处理完成："
-                f"{message_id} / 状态 {ocr.get('status')} / "
+                f"状态 {ocr.get('status')} / "
                 f"新增字段 {added_fields} / 新增问题证据 {added_evidence}",
-                flush=True,
             )
         return retry_required, attempt_count
 
@@ -2985,6 +3272,23 @@ class DiscordChannelMonitor:
             async with self.support_message_lock:
                 channels = self.support_message_state.setdefault("channels", {})
                 channel_state = channels.setdefault(channel_id, {})
+                # 先保存路由属性；即使首次正文请求失败，日报也能正确判断
+                # 该错误来自 Support 还是仅审计的 Event 路由。
+                channel_state.update(
+                    {
+                        "guild_id": guild_id,
+                        "parent_id": parent_id,
+                        "route_label": str(
+                            route.get("label") or "Ticket"
+                        )[:100],
+                        "include_in_daily": bool(
+                            route.get("include_in_daily")
+                        ),
+                        "ocr_mode": str(route.get("ocr_mode") or "off"),
+                        "name": str(channel_payload.get("name") or "")[:100],
+                        "deleted_at": "",
+                    }
+                )
                 last_seen_message_id = str(
                     channel_state.get("last_seen_message_id") or ""
                 )
@@ -3141,7 +3445,6 @@ class DiscordChannelMonitor:
                             "deleted_at": "",
                         }
                     )
-                    self.support_message_state["last_success_at"] = now_iso
                     channel_errors = self.support_message_state.setdefault(
                         "channel_errors",
                         {},
@@ -3162,12 +3465,10 @@ class DiscordChannelMonitor:
                         {record["id"] for record in new_records}
                     )
                 if ordered_message_ids:
-                    print(
+                    timestamped_log(
                         "工单消息补收完成："
-                        f"{route['label']} / "
-                        f"{channel_id} / {len(ordered_message_ids)} 条 / "
-                        f"写入 {len(new_records)} 条有效对话",
-                        flush=True,
+                        f"{route['label']} / {len(ordered_message_ids)} 条 / "
+                        f"写入 {len(new_records)} 条有效对话"
                     )
                 return len(new_records)
             except Exception as exc:
@@ -3323,10 +3624,7 @@ class DiscordChannelMonitor:
                             dict(gateway_payload or {}),
                             wake_pending_loop=False,
                         )
-                        print(
-                            f"Help 首条实时消息已建立游标：{gateway_message_id}",
-                            flush=True,
-                        )
+                        timestamped_log("Help 首条实时消息已建立游标。")
                     else:
                         latest_messages = await self.discord_api_get(
                             session,
@@ -3345,10 +3643,10 @@ class DiscordChannelMonitor:
                                     "last_seen_message_id"
                                 ] = baseline_message_id
                                 self.save_help_message_state()
-                        print(
-                            "Help 消息汇总基线已建立："
-                            f"{baseline_message_id or '频道暂无消息'}",
-                            flush=True,
+                        timestamped_log(
+                            "Help 消息汇总基线已建立。"
+                            if baseline_message_id
+                            else "Help 频道暂无消息，空基线已建立。"
                         )
                     reconciliation_completed = True
                     return
@@ -3413,12 +3711,9 @@ class DiscordChannelMonitor:
                     )
 
                 if ordered_message_ids:
-                    print(
+                    timestamped_log(
                         "Help 有序补收完成："
-                        f"{len(ordered_message_ids)} 条 / "
-                        f"{ordered_message_ids[0]} → "
-                        f"{ordered_message_ids[-1]}",
-                        flush=True,
+                        f"{len(ordered_message_ids)} 条"
                     )
                 reconciliation_completed = True
             finally:
@@ -3437,7 +3732,10 @@ class DiscordChannelMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(f"Help 消息补收失败：{exc}", file=sys.stderr, flush=True)
+                timestamped_log(
+                    f"Help 消息补收失败：{safe_log_error(exc)}",
+                    error=True,
+                )
 
             try:
                 await asyncio.wait_for(
@@ -3486,10 +3784,7 @@ class DiscordChannelMonitor:
                         outbox = self.help_message_state.get("collection_outbox") or {}
                         outbox.pop(message_id, None)
                         self.save_help_message_state()
-                    print(
-                        f"Help 消息已发送到汇总话题：{message_id}",
-                        flush=True,
-                    )
+                    timestamped_log("一条 Help 消息已发送到汇总话题。")
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -3502,10 +3797,9 @@ class DiscordChannelMonitor:
                             else:
                                 current["next_attempt_at"] = time.time() + 60
                             self.save_help_message_state()
-                    print(
-                        f"Help 汇总发送失败：{message_id} / {exc}",
-                        file=sys.stderr,
-                        flush=True,
+                    timestamped_log(
+                        f"Help 汇总发送失败：{safe_log_error(exc)}",
+                        error=True,
                     )
 
             try:
@@ -3584,6 +3878,14 @@ class DiscordChannelMonitor:
         if not self.ticket_routes:
             return
 
+        scan_started_at = datetime.now(timezone.utc)
+        async with self.support_message_lock:
+            self.support_message_state[
+                "last_scan_started_at"
+            ] = scan_started_at.isoformat()
+            self.save_support_message_state()
+        timestamped_log("工单完整扫描开始。")
+
         guild_id = await self.resolve_ticket_guild_id(session)
         channels = await self.discord_api_get(session, f"/guilds/{guild_id}/channels")
         if not isinstance(channels, list):
@@ -3598,37 +3900,20 @@ class DiscordChannelMonitor:
         ]
         candidates.sort(key=lambda channel: int(str(channel.get("id") or "0")))
         scanned_collected_ids: set[str] = set()
+        daily_channel_ids: set[str] = set()
+        daily_error_ids: set[str] = set()
 
         for payload in candidates:
             channel_id = str(payload.get("id") or "")
             payload["guild_id"] = guild_id
             route = self.ticket_routes[str(payload.get("parent_id") or "")]
-            if self.remember_ticket_channel(channel_id):
-                target = route.get("target") or self.ticket_default_target
-                alert = build_ticket_alert(payload, route, catch_up=True)
-                try:
-                    # 补漏发送失败时不落盘，下一轮扫描会自动重试。
-                    async with self.hermes_send_lock:
-                        await send_via_hermes(target, alert, attempts=1)
-                except Exception:
-                    self.forget_recent_ticket_channel(channel_id)
-                    raise
 
-                record_ticket_event(
-                    payload,
-                    route,
-                    detection_source="reconciliation",
-                )
-                self.recorded_ticket_channel_ids.add(channel_id)
-                print(
-                    f"已补发休眠/离线期间工单："
-                    f"{route['label']} / {channel_id}",
-                    flush=True,
-                )
-
+            # 正文先于 Telegram 提醒采集；通知网络再慢也不会占用采集路径。
             if route.get("collect_messages"):
                 self.support_channel_ids.add(channel_id)
                 scanned_collected_ids.add(channel_id)
+                if route.get("include_in_daily"):
+                    daily_channel_ids.add(channel_id)
                 try:
                     await self.reconcile_support_ticket_messages(
                         session,
@@ -3637,11 +3922,28 @@ class DiscordChannelMonitor:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    print(
-                        f"工单正文补收失败："
-                        f"{route['label']} / {channel_id} / {exc}",
-                        file=sys.stderr,
-                        flush=True,
+                    if route.get("include_in_daily"):
+                        daily_error_ids.add(channel_id)
+                    timestamped_log(
+                        "工单正文补收失败："
+                        f"{route['label']} / {type(exc).__name__}",
+                        error=True,
+                    )
+
+            if self.remember_ticket_channel(channel_id):
+                try:
+                    await self.queue_ticket_notification(
+                        payload,
+                        route,
+                        catch_up=True,
+                        detection_source="reconciliation",
+                    )
+                except Exception as exc:
+                    self.forget_recent_ticket_channel(channel_id)
+                    timestamped_log(
+                        "工单提醒入队失败："
+                        f"{route['label']} / {type(exc).__name__}",
+                        error=True,
                     )
 
         # Ticket Tool 关闭工单时可能把频道移动到其他分类。只要频道仍存在，
@@ -3673,6 +3975,8 @@ class DiscordChannelMonitor:
             original_route = self.ticket_routes.get(original_parent_id)
             if not original_route or not original_route.get("collect_messages"):
                 continue
+            if original_route.get("include_in_daily"):
+                daily_channel_ids.add(channel_id)
             collected_payload = {
                 **live_channel,
                 "id": channel_id,
@@ -3692,13 +3996,37 @@ class DiscordChannelMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(
+                if original_route.get("include_in_daily"):
+                    daily_error_ids.add(channel_id)
+                timestamped_log(
                     f"已关闭工单正文补收失败："
-                    f"{original_route['label']} / "
-                    f"{channel_id} / {exc}",
-                    file=sys.stderr,
-                    flush=True,
+                    f"{original_route['label']} / {type(exc).__name__}",
+                    error=True,
                 )
+
+        scan_completed_at = datetime.now(timezone.utc)
+        async with self.support_message_lock:
+            self.support_message_state.update(
+                {
+                    "last_scan_completed_at": scan_completed_at.isoformat(),
+                    "last_scan_daily_channels": len(daily_channel_ids),
+                    "last_scan_daily_errors": len(daily_error_ids),
+                }
+            )
+            if not daily_error_ids:
+                self.support_message_state[
+                    "last_success_at"
+                ] = scan_completed_at.isoformat()
+            self.save_support_message_state()
+        elapsed = max(
+            0.0,
+            (scan_completed_at - scan_started_at).total_seconds(),
+        )
+        timestamped_log(
+            "工单完整扫描完成："
+            f"日报频道 {len(daily_channel_ids)} 个 / "
+            f"错误 {len(daily_error_ids)} 个 / 耗时 {elapsed:.1f} 秒"
+        )
 
     async def ticket_reconciliation_loop(
         self,
@@ -3711,7 +4039,10 @@ class DiscordChannelMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                print(f"工单补漏扫描失败：{exc}", file=sys.stderr, flush=True)
+                timestamped_log(
+                    f"工单完整扫描失败：{type(exc).__name__}",
+                    error=True,
+                )
 
             try:
                 await asyncio.wait_for(
@@ -3762,7 +4093,10 @@ class DiscordChannelMonitor:
                 async with self.hermes_send_lock:
                     await send_via_hermes(target, alert)
             except Exception as exc:
-                print(f"Hermes 通知发送失败：{exc}", file=sys.stderr, flush=True)
+                timestamped_log(
+                    f"Hermes 通知发送失败：{safe_log_error(exc)}",
+                    error=True,
+                )
             finally:
                 self.notification_queue.task_done()
 
@@ -3827,10 +4161,10 @@ class DiscordChannelMonitor:
             raise
         except Exception as exc:
             self.help_reconciliation_requested.set()
-            print(
-                f"{connection_label}后的 Help 优先补收失败：{exc}",
-                file=sys.stderr,
-                flush=True,
+            timestamped_log(
+                f"{connection_label}后的 Help 优先补收失败："
+                f"{safe_log_error(exc)}",
+                error=True,
             )
 
     async def handle_ticket_channel(self, payload: dict[str, Any]) -> None:
@@ -3874,19 +4208,20 @@ class DiscordChannelMonitor:
         if not self.remember_ticket_channel(channel_id):
             return
 
-        target = route.get("target") or self.ticket_default_target
-        alert = build_ticket_alert(payload, route)
         try:
-            self.notification_queue.put_nowait((target, alert))
-            record_ticket_event(payload, route, detection_source="gateway")
-            self.recorded_ticket_channel_ids.add(channel_id)
-            print(
-                f"已捕获新工单并加入 Telegram 通知队列：{route['label']} / {channel_id}",
-                flush=True,
+            await self.queue_ticket_notification(
+                payload,
+                route,
+                catch_up=False,
+                detection_source="gateway",
             )
-        except asyncio.QueueFull:
+        except Exception as exc:
             self.forget_recent_ticket_channel(channel_id)
-            print("通知队列已满，本条工单提醒未能加入。", file=sys.stderr, flush=True)
+            timestamped_log(
+                "新工单提醒入队失败："
+                f"{route['label']} / {type(exc).__name__}",
+                error=True,
+            )
 
     async def connect_once(self, session: aiohttp.ClientSession) -> None:
         gateway_url = self.resume_gateway_url or await self.get_gateway_url(session)
@@ -3988,22 +4323,29 @@ class DiscordChannelMonitor:
                             try:
                                 await self.handle_message_create(session, data)
                             except Exception as exc:  # 单条通知失败不能让长期监听退出
-                                print(f"处理消息失败：{exc}", file=sys.stderr, flush=True)
+                                timestamped_log(
+                                    f"处理消息失败：{safe_log_error(exc)}",
+                                    error=True,
+                                )
                         elif event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE"}:
                             try:
                                 if event_type == "CHANNEL_UPDATE":
                                     await self.handle_member_stats_channel(data)
                                 await self.handle_ticket_channel(data)
                             except Exception as exc:
-                                print(f"处理工单频道失败：{exc}", file=sys.stderr, flush=True)
+                                timestamped_log(
+                                    "处理工单频道失败："
+                                    f"{safe_log_error(exc)}",
+                                    error=True,
+                                )
                         elif event_type in {"CHANNEL_DELETE", "THREAD_DELETE"}:
                             try:
                                 await self.mark_support_channel_deleted(data)
                             except Exception as exc:
-                                print(
-                                    f"记录 Support 工单删除失败：{exc}",
-                                    file=sys.stderr,
-                                    flush=True,
+                                timestamped_log(
+                                    "记录工单删除失败："
+                                    f"{safe_log_error(exc)}",
+                                    error=True,
                                 )
 
                     elif incoming.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
@@ -4023,6 +4365,9 @@ class DiscordChannelMonitor:
         await self.discard_disabled_help_collection_outbox()
         self.telegram_target = await resolve_hermes_target(self.telegram_target)
         worker_task = asyncio.create_task(self.notification_worker())
+        ticket_notification_task = asyncio.create_task(
+            self.ticket_notification_outbox_loop()
+        )
         reconciliation_task: asyncio.Task[None] | None = None
         pending_message_task: asyncio.Task[None] | None = None
         help_reconciliation_task: asyncio.Task[None] | None = None
@@ -4084,10 +4429,11 @@ class DiscordChannelMonitor:
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
-                            print(
-                                f"连接异常：{exc}；{retry_delay} 秒后重试。",
-                                file=sys.stderr,
-                                flush=True,
+                            timestamped_log(
+                                "连接异常："
+                                f"{safe_log_error(exc)}；"
+                                f"{retry_delay} 秒后重试。",
+                                error=True,
                             )
 
                         try:
@@ -4108,6 +4454,7 @@ class DiscordChannelMonitor:
                             help_reconciliation_task,
                             pending_message_task,
                             reconciliation_task,
+                            ticket_notification_task,
                         )
                         if task is not None
                     )
@@ -4118,12 +4465,21 @@ class DiscordChannelMonitor:
                             await task
         finally:
             worker_task.cancel()
+            ticket_notification_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await ticket_notification_task
 
 
 def self_test() -> None:
     help_spam_state_self_test()
+    assert ticket_notification_retry_delay(1) == 60
+    assert ticket_notification_retry_delay(2) == 120
+    assert ticket_notification_retry_delay(99) == 900
+    assert "100000000000000001" not in safe_log_error(
+        RuntimeError("Discord 100000000000000001 failed")
+    )
     assert parse_verified_member_count("Verified: 631") == 631
     assert parse_verified_member_count(" verified : 1,024 ") == 1024
     assert parse_verified_member_count("Verified: 12,34") is None
@@ -4155,19 +4511,19 @@ def self_test() -> None:
     assert delayed_alert.startswith(MESSAGE_SEPARATOR)
     assert delayed_alert.endswith(MESSAGE_SEPARATOR)
     assert "[点击进入 Discord](https://discord.com/" in delayed_alert
-    sample["member"]["roles"] = ["100000000000000001"]
-    assert member_has_allowed_role(sample, {"100000000000000001", "100000000000000002"})
-    assert not member_has_allowed_role(sample, {"100000000000000003"})
-    assert member_has_any_role(sample, {"100000000000000001"})
-    assert not member_has_any_role(sample, {"100000000000000003"})
+    sample["member"]["roles"] = ["100000000000000002"]
+    assert member_has_allowed_role(sample, {"100000000000000002", "100000000000000003"})
+    assert not member_has_allowed_role(sample, {"100000000000000004"})
+    assert member_has_any_role(sample, {"100000000000000002"})
+    assert not member_has_any_role(sample, {"100000000000000004"})
     # 同时拥有“允许”和“排除”身份组时，调用方必须让排除规则优先。
-    sample["member"]["roles"] = ["100000000000000001", "100000000000000004"]
-    assert member_has_allowed_role(sample, {"100000000000000001"})
-    assert member_has_any_role(sample, {"100000000000000004"})
+    sample["member"]["roles"] = ["100000000000000002", "100000000000000005"]
+    assert member_has_allowed_role(sample, {"100000000000000002"})
+    assert member_has_any_role(sample, {"100000000000000005"})
     assert not member_passes_role_filters(
         sample,
-        {"100000000000000001"},
-        {"100000000000000004"},
+        {"100000000000000002"},
+        {"100000000000000005"},
     )
     support_content = (
         "The settings page shows error WEB-503.\n"
@@ -4237,22 +4593,22 @@ def self_test() -> None:
     assert ocr_state["skipped_count"] == 1
     support_error_state = {
         "channels": {
-            "100000000000000005": {
+            "100000000000000006": {
                 "deleted_at": "2026-07-30T07:52:27+00:00",
             },
-            "100000000000000006": {"deleted_at": ""},
+            "100000000000000007": {"deleted_at": ""},
         },
         "channel_errors": {
-            "100000000000000005": "HTTP 404 Unknown Channel",
-            "100000000000000006": "HTTP 500 temporary failure",
+            "100000000000000006": "HTTP 404 Unknown Channel",
+            "100000000000000007": "HTTP 500 temporary failure",
         },
         "last_error": "HTTP 404 Unknown Channel",
         "last_error_at": "2026-07-30T07:52:26+00:00",
     }
     refresh_support_error_summary(support_error_state)
-    assert "100000000000000005" not in support_error_state["channel_errors"]
+    assert "100000000000000006" not in support_error_state["channel_errors"]
     assert support_error_state["last_error"] == "HTTP 500 temporary failure"
-    support_error_state["channels"]["100000000000000006"][
+    support_error_state["channels"]["100000000000000007"][
         "deleted_at"
     ] = "2026-07-30T08:00:00+00:00"
     refresh_support_error_summary(support_error_state)
@@ -4264,12 +4620,12 @@ def self_test() -> None:
     monitor_stub.support_ocr_max_images = 3
     monitor_stub.support_ocr_max_bytes = 8 * 1024 * 1024
     support_payload = {
-        "id": "100000000000000007",
-        "channel_id": "100000000000000005",
+        "id": "100000000000000008",
+        "channel_id": "100000000000000006",
         "timestamp": "2026-07-30T01:00:00+00:00",
         "content": "please help",
         "author": {
-            "id": "100000000000000008",
+            "id": "100000000000000009",
             "username": "buyer",
             "bot": False,
         },
@@ -4384,79 +4740,79 @@ def self_test() -> None:
         "Safari browser\n"
     )
     assert generic_hints[0] == "technical_issue"
-    sample["member"]["roles"] = ["100000000000000001"]
+    sample["member"]["roles"] = ["100000000000000002"]
     assert member_passes_role_filters(
         sample,
-        {"100000000000000001"},
-        {"100000000000000004"},
+        {"100000000000000002"},
+        {"100000000000000005"},
     )
     pending = {
         "user_id": "444555666",
         "message_ids": ["123456789", "123456790"],
     }
     staff_reply = {
-        "member": {"roles": ["100000000000000004"]},
+        "member": {"roles": ["100000000000000005"]},
         "message_reference": {"message_id": "123456790"},
         "mentions": [],
     }
     assert staff_response_matches_pending(
         staff_reply,
         pending,
-        {"100000000000000004"},
+        {"100000000000000005"},
     )
     staff_mention = {
-        "member": {"roles": ["100000000000000004"]},
+        "member": {"roles": ["100000000000000005"]},
         "mentions": [{"id": "444555666"}],
     }
     assert staff_response_matches_pending(
         staff_mention,
         pending,
-        {"100000000000000004"},
+        {"100000000000000005"},
     )
     unrelated_staff_message = {
-        "member": {"roles": ["100000000000000004"]},
+        "member": {"roles": ["100000000000000005"]},
         "mentions": [],
     }
     assert not staff_response_matches_pending(
         unrelated_staff_message,
         pending,
-        {"100000000000000004"},
+        {"100000000000000005"},
     )
     bd_reply = {
-        "member": {"roles": ["100000000000000009"]},
+        "member": {"roles": ["100000000000000010"]},
         "message_reference": {"message_id": "123456790"},
         "mentions": [],
     }
     assert not staff_response_matches_pending(
         bd_reply,
         pending,
-        {"100000000000000010", "100000000000000004"},
+        {"100000000000000011", "100000000000000005"},
     )
     routes = parse_ticket_routes(
-        '{"100000000000000011":{"label":"Support ticket",'
+        '{"100000000000000012":{"label":"Support ticket",'
         '"target":"telegram:-100123:2","owner":"客服负责人"}}'
     )
     ticket_alert = build_ticket_alert(
         {
-            "id": "100000000000000012",
-            "guild_id": "100000000000000013",
+            "id": "100000000000000013",
+            "guild_id": "100000000000000014",
             "name": "support-buyer123",
-            "parent_id": "100000000000000011",
+            "parent_id": "100000000000000012",
             "type": 0,
         },
-        routes["100000000000000011"],
+        routes["100000000000000012"],
     )
     assert "新问题工单" in ticket_alert
     assert "客服负责人" in ticket_alert
     assert (
         "[打开 Discord 工单](https://discord.com/channels/"
-        "100000000000000013/100000000000000012)"
+        "100000000000000014/100000000000000013)"
     ) in ticket_alert
     assert ticket_alert.count(MESSAGE_SEPARATOR) == 2
     collab_alert = build_ticket_alert(
         {
-            "id": "100000000000000014",
-            "guild_id": "100000000000000013",
+            "id": "100000000000000015",
+            "guild_id": "100000000000000014",
             "name": "ticket-0010",
             "type": 0,
         },
@@ -4466,13 +4822,13 @@ def self_test() -> None:
     assert "#ticket-0010" in collab_alert
     catch_up_alert = build_ticket_alert(
         {
-            "id": "100000000000000012",
-            "guild_id": "100000000000000013",
+            "id": "100000000000000013",
+            "guild_id": "100000000000000014",
             "name": "support-buyer123",
-            "parent_id": "100000000000000011",
+            "parent_id": "100000000000000012",
             "type": 0,
         },
-        routes["100000000000000011"],
+        routes["100000000000000012"],
         catch_up=True,
     )
     assert "补发｜问题工单" in catch_up_alert
@@ -4517,5 +4873,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        print(f"启动失败：{exc}", file=sys.stderr)
+        timestamped_log(
+            f"启动失败：{safe_log_error(exc)}",
+            error=True,
+        )
         sys.exit(1)

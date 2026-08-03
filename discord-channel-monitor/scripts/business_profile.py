@@ -93,6 +93,14 @@ class BusinessProfile:
         del content
         return []
 
+    def classify_ticket_scope(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """决定工单是否属于日报问题；通用适配器默认保留。"""
+        del messages
+        return "include"
+
     def extract_ocr_fields(
         self,
         accepted_lines: list[tuple[str, str, float]],
@@ -233,6 +241,7 @@ def self_test() -> None:
     assert len(digest) == 64
     assert profile.normalize_category("technical") == "技术问题"
     assert profile.extract_message_fields("hello") == []
+    assert profile.classify_ticket_scope([]) == "include"
     assert "technical_issue" in profile.ocr_category_hints("page failed")
 
 

@@ -66,6 +66,8 @@ MAX_PROCESSED_MESSAGE_IDS = 5000
 MODEL_TIMEOUT_SECONDS = 60
 PROCESS_STOP_GRACE_SECONDS = 5
 FULL_WAKE_STABLE_SECONDS = 120
+TICKET_STATE_MAX_AGE_SECONDS = 10 * 60
+TICKET_STATE_MAX_WAIT_SECONDS = 30 * 60
 SUMMARY_SCHEDULE_HOUR = 10
 SUMMARY_SCHEDULE_MINUTE = 0
 TELEGRAM_PART_LIMIT = 3500
@@ -920,6 +922,10 @@ def load_support_context_messages(
         "status": "unavailable",
         "warning": "工单正文索引尚未建立",
         "last_success_at": "",
+        "last_scan_completed_at": "",
+        "ticket_count": 0,
+        "excluded_fulfillment_count": 0,
+        "excluded_message_ids": [],
     }
     try:
         raw_state = json.loads(path.read_text(encoding="utf-8"))
@@ -932,17 +938,7 @@ def load_support_context_messages(
         health["warning"] = "工单正文索引格式无效"
         return [], health
 
-    health = support_collection_health(raw_state)
-    last_error = str(health.get("last_error") or "")
-    health = {
-        "status": "degraded" if last_error else "ok",
-        "warning": (
-            "工单正文采集异常：" + last_error[:180]
-            if last_error
-            else ""
-        ),
-        "last_success_at": str(raw_state.get("last_success_at") or ""),
-    }
+    health = support_collection_health(raw_state, now_utc=end_time)
     collected: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for raw_message in raw_state.get("messages") or []:
@@ -1107,15 +1103,75 @@ def load_support_context_messages(
             }
         )
     collected.sort(key=lambda item: item["sort_time"])
+    collected, scope_stats = filter_ticket_scope(collected)
+    health.update(scope_stats)
     return collected, health
 
 
-def support_collection_health(raw_state: dict[str, Any]) -> dict[str, str]:
-    """只把仍存在的工单错误视为当前采集异常。"""
+def filter_ticket_scope(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """按整张脱敏工单排除纯兑奖流程，并返回不含正文的统计。"""
+    conversations: dict[str, list[dict[str, Any]]] = {}
+    for message in messages:
+        conversation_id = str(message.get("conversation_id") or "")
+        if conversation_id:
+            conversations.setdefault(conversation_id, []).append(message)
+
+    new_conversation_ids = {
+        conversation_id
+        for conversation_id, items in conversations.items()
+        if any(bool(item.get("is_new")) for item in items)
+    }
+    excluded_conversation_ids: set[str] = set()
+    review_count = 0
+    for conversation_id, items in conversations.items():
+        decision = str(
+            ACTIVE_BUSINESS_PROFILE.classify_ticket_scope(items) or "review"
+        )
+        if decision == "exclude_fulfillment":
+            excluded_conversation_ids.add(conversation_id)
+        elif decision not in {"include", "review"}:
+            review_count += 1
+        elif decision == "review":
+            review_count += 1
+
+    excluded_message_ids = [
+        str(item.get("id") or "")
+        for item in messages
+        if str(item.get("conversation_id") or "")
+        in excluded_conversation_ids
+        and str(item.get("id") or "").isdigit()
+    ]
+    filtered = [
+        item
+        for item in messages
+        if str(item.get("conversation_id") or "")
+        not in excluded_conversation_ids
+    ]
+    return filtered, {
+        "ticket_count": len(new_conversation_ids),
+        "excluded_fulfillment_count": len(
+            new_conversation_ids & excluded_conversation_ids
+        ),
+        "scope_review_count": review_count,
+        "excluded_message_ids": excluded_message_ids,
+    }
+
+
+def support_collection_health(
+    raw_state: dict[str, Any],
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """以完整扫描时间和日报路由错误判断工单索引是否可用。"""
+    now_utc = (now_utc or datetime.now(timezone.utc)).astimezone(
+        timezone.utc
+    )
     channels = raw_state.get("channels")
     channels = channels if isinstance(channels, dict) else {}
     raw_errors = raw_state.get("channel_errors")
-    active_errors: list[str] = []
+    daily_errors: list[str] = []
     if isinstance(raw_errors, dict) and raw_errors:
         for channel_id, error in raw_errors.items():
             channel = channels.get(str(channel_id))
@@ -1123,16 +1179,58 @@ def support_collection_health(raw_state: dict[str, Any]) -> dict[str, str]:
                 channel.get("deleted_at") or ""
             ).strip():
                 continue
+            if isinstance(channel, dict) and not bool(
+                channel.get("include_in_daily", True)
+            ):
+                continue
             clean_error = str(error).strip()
             if clean_error:
-                active_errors.append(clean_error[:500])
-        last_error = active_errors[0] if active_errors else ""
+                daily_errors.append(clean_error[:500])
+    try:
+        recorded_daily_errors = max(
+            0,
+            int(raw_state.get("last_scan_daily_errors") or 0),
+        )
+    except (TypeError, ValueError):
+        recorded_daily_errors = len(daily_errors)
+    error_count = max(recorded_daily_errors, len(daily_errors))
+    last_error = daily_errors[0] if daily_errors else ""
+    completed_at = parse_optional_time(
+        raw_state.get("last_scan_completed_at")
+    )
+    age_seconds: int | None = None
+    if completed_at is not None:
+        age_seconds = max(0, int((now_utc - completed_at).total_seconds()))
+
+    if completed_at is None:
+        status = "unavailable"
+        warning = "工单完整扫描尚未成功完成"
+    elif error_count:
+        status = "degraded"
+        warning = "工单正文采集异常，日报范围频道存在读取失败"
+    elif age_seconds is not None and age_seconds > TICKET_STATE_MAX_AGE_SECONDS:
+        status = "stale"
+        warning = "工单正文索引超过10分钟未完成新一轮扫描"
     else:
-        # 兼容尚未包含 channel_errors 的旧版状态文件。
-        last_error = str(raw_state.get("last_error") or "").strip()[:500]
+        status = "ok"
+        warning = ""
     return {
+        "status": status,
+        "warning": warning,
         "last_error": last_error,
         "last_success_at": str(raw_state.get("last_success_at") or ""),
+        "last_scan_completed_at": str(
+            raw_state.get("last_scan_completed_at") or ""
+        ),
+        "last_scan_daily_channels": max(
+            0,
+            int(raw_state.get("last_scan_daily_channels") or 0),
+        ) if str(raw_state.get("last_scan_daily_channels") or "0").isdigit() else 0,
+        "last_scan_daily_errors": error_count,
+        "age_seconds": age_seconds,
+        "ticket_count": 0,
+        "excluded_fulfillment_count": 0,
+        "excluded_message_ids": [],
     }
 
 
@@ -2722,6 +2820,29 @@ def public_user_label(case: dict[str, Any]) -> str:
     return display
 
 
+def ticket_collection_line(health: dict[str, Any]) -> str:
+    """生成不含频道或用户标识的工单采集状态行。"""
+    completed_at = parse_optional_time(health.get("last_scan_completed_at"))
+    completed_text = (
+        completed_at.astimezone(LOCAL_TIMEZONE).strftime("%m-%d %H:%M")
+        if completed_at is not None
+        else "尚未完成"
+    )
+    try:
+        ticket_count = max(0, int(health.get("ticket_count") or 0))
+        excluded_count = max(
+            0,
+            int(health.get("excluded_fulfillment_count") or 0),
+        )
+    except (TypeError, ValueError):
+        ticket_count = 0
+        excluded_count = 0
+    return (
+        f"🗂 工单采集：{completed_text}｜本轮工单：{ticket_count}｜"
+        f"纯兑奖排除：{excluded_count}｜待处理：0"
+    )
+
+
 def case_source_label(case: dict[str, Any]) -> str:
     """将内部来源转换为日报中的简短可读标签。"""
     sources = {
@@ -2864,7 +2985,7 @@ def build_daily_report(
     archived_cases: list[dict[str, Any]],
     first_report_case_ids: set[str] | None = None,
     silently_closed_case_ids: set[str] | None = None,
-    support_health: dict[str, str] | None = None,
+    support_health: dict[str, Any] | None = None,
     member_stats_line_text: str = "",
 ) -> str:
     """由已校验案例生成确定性的 Telegram 日报。"""
@@ -2913,6 +3034,8 @@ def build_daily_report(
     ]
     if member_stats_line_text:
         lines.append(member_stats_line_text)
+    if support_health:
+        lines.append(ticket_collection_line(support_health))
     if support_health and support_health.get("status") != "ok":
         warning = safe_public_text(
             support_health.get("warning"),
@@ -2936,7 +3059,7 @@ def build_daily_report(
                 ]
             )
         else:
-            lines.extend(["", "本统计区间暂无有效用户反馈。"])
+            lines.extend(["", "本统计区间暂无有效用户问题。"])
         return "\n".join(lines)
 
     if updated_open:
@@ -3138,6 +3261,84 @@ def resolve_daily_summary_target(env: dict[str, str]) -> str:
     return target
 
 
+def read_support_collection_health(
+    env: dict[str, str],
+    *,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    """只读取工单采集状态，不在新鲜度确认前访问 Help 或模型。"""
+    path = resolve_support_message_state_path(env)
+    try:
+        raw_state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return support_collection_health({}, now_utc=now_utc)
+    except (OSError, json.JSONDecodeError):
+        return {
+            **support_collection_health({}, now_utc=now_utc),
+            "warning": "工单正文索引无法读取",
+        }
+    if not isinstance(raw_state, dict):
+        return {
+            **support_collection_health({}, now_utc=now_utc),
+            "warning": "工单正文索引格式无效",
+        }
+    return support_collection_health(raw_state, now_utc=now_utc)
+
+
+def clear_collection_wait_state(state: dict[str, Any]) -> bool:
+    """采集恢复后清除等待标记；正式统计截止点保持独立。"""
+    keys = (
+        "collection_wait_started_at",
+        "collection_wait_cutoff",
+        "collection_wait_reason",
+        "collection_warning_sent_for",
+    )
+    changed = any(str(state.get(key) or "") for key in keys)
+    for key in keys:
+        state[key] = ""
+    return changed
+
+
+def record_collection_wait(
+    state: dict[str, Any],
+    *,
+    now_utc: datetime,
+    health: dict[str, Any],
+    target: str,
+) -> None:
+    """等待完整扫描；满30分钟只告警一次且绝不推进日报截止点。"""
+    now_utc = now_utc.astimezone(timezone.utc)
+    started_at = parse_optional_time(state.get("collection_wait_started_at"))
+    if started_at is None:
+        started_at = now_utc
+        state["collection_wait_started_at"] = started_at.isoformat()
+        state["collection_wait_cutoff"] = now_utc.isoformat()
+    state["collection_wait_reason"] = safe_public_text(
+        health.get("warning") or "工单采集状态异常",
+        max_length=180,
+    )
+    save_runtime_state(state)
+
+    elapsed = max(0.0, (now_utc - started_at).total_seconds())
+    wait_key = started_at.isoformat()
+    if (
+        elapsed < TICKET_STATE_MAX_WAIT_SECONDS
+        or state.get("collection_warning_sent_for") == wait_key
+    ):
+        return
+    try:
+        send_to_telegram(
+            target,
+            "⚠️ Discord 用户反馈日报暂未发送。\n"
+            "工单数据连续30分钟未完成有效采集，原统计截止点已保留，"
+            "系统会继续自动重试。",
+        )
+        state["collection_warning_sent_for"] = wait_key
+        save_runtime_state(state)
+    except RuntimeError:
+        pass
+
+
 def send_to_telegram(target: str, message: str) -> None:
     """通过 Hermes 发送，并以退出码确认 Telegram 接收。"""
     code, stdout, stderr, timed_out = run_process(
@@ -3185,6 +3386,7 @@ def clear_pending_report(state: dict[str, Any]) -> None:
             "pending_processed_message_ids": [],
             "pending_report_message_count": 0,
             "pending_member_stats_snapshot": {},
+            "pending_ticket_filter_stats": {},
             "pending_exclusion_revision": None,
             "pending_business_profile_digest": "",
         }
@@ -3269,6 +3471,15 @@ def mark_success(
             "retry_after_wake_at": "",
             "last_ai_failure_at": "",
             "last_ai_failures": [],
+            "last_ticket_filter_stats": (
+                state.get("pending_ticket_filter_stats")
+                if isinstance(state.get("pending_ticket_filter_stats"), dict)
+                else {}
+            ),
+            "collection_wait_started_at": "",
+            "collection_wait_cutoff": "",
+            "collection_wait_reason": "",
+            "collection_warning_sent_for": "",
         }
     )
     commit_pending_member_stats(state, committed_at=now)
@@ -3346,6 +3557,7 @@ def build_report_from_discord(
     list[str],
     int,
     dict[str, Any],
+    dict[str, int],
 ]:
     """合并 Help API 与本地工单索引并生成日报；本函数不写状态。"""
     token = (
@@ -3392,6 +3604,25 @@ def build_report_from_discord(
         report_start=report_start,
         end_time=end_time,
     )
+    excluded_scope_ids = [
+        str(item)
+        for item in (support_health.get("excluded_message_ids") or [])
+        if str(item).isdigit()
+    ]
+    ticket_filter_stats = {
+        "ticket_count": max(
+            0,
+            int(support_health.get("ticket_count") or 0),
+        ),
+        "excluded_fulfillment_count": max(
+            0,
+            int(support_health.get("excluded_fulfillment_count") or 0),
+        ),
+        "scope_review_count": max(
+            0,
+            int(support_health.get("scope_review_count") or 0),
+        ),
+    }
     all_messages = sorted(
         [*help_messages, *support_messages],
         key=lambda item: item["sort_time"],
@@ -3478,6 +3709,7 @@ def build_report_from_discord(
                 failures,
                 exclusion_revision,
                 member_stats_snapshot,
+                ticket_filter_stats,
             )
         active_cases = cases or active_cases
 
@@ -3488,7 +3720,15 @@ def build_report_from_discord(
     )
     archived_cases.extend(newly_archived)
     processed_next = prune_processed_ids(
-        list(dict.fromkeys([*processed_ids, *[item["id"] for item in messages]])),
+        list(
+            dict.fromkeys(
+                [
+                    *processed_ids,
+                    *[item["id"] for item in messages],
+                    *excluded_scope_ids,
+                ]
+            )
+        ),
         end_time=end_time,
     )
     first_report_case_ids, silently_closed_case_ids = apply_waiting_lifecycle(
@@ -3525,6 +3765,7 @@ def build_report_from_discord(
         failures,
         exclusion_revision,
         member_stats_snapshot,
+        ticket_filter_stats,
     )
 
 
@@ -3640,6 +3881,21 @@ def run_scheduled_summary() -> None:
                 clear_pending_report(state)
                 save_runtime_state(state)
 
+    collection_health = read_support_collection_health(
+        env,
+        now_utc=now_utc,
+    )
+    if collection_health.get("status") != "ok":
+        record_collection_wait(
+            state,
+            now_utc=now_utc,
+            health=collection_health,
+            target=target,
+        )
+        return
+    if clear_collection_wait_state(state):
+        save_runtime_state(state)
+
     for _attempt in range(3):
         (
             parts,
@@ -3649,6 +3905,7 @@ def run_scheduled_summary() -> None:
             failures,
             built_revision,
             member_stats_snapshot,
+            ticket_filter_stats,
         ) = build_report_from_discord(
             state=state,
             env=env,
@@ -3678,6 +3935,7 @@ def run_scheduled_summary() -> None:
                 "pending_processed_message_ids": processed_ids,
                 "pending_report_message_count": message_count,
                 "pending_member_stats_snapshot": member_stats_snapshot,
+                "pending_ticket_filter_stats": ticket_filter_stats,
                 "pending_exclusion_revision": built_revision,
                 "pending_business_profile_digest": profile_digest,
             }
@@ -3814,6 +4072,7 @@ def run_preview(*, hours: float | None, send_test: bool) -> None:
         failures,
         _exclusion_revision,
         _member_stats_snapshot,
+        _ticket_filter_stats,
     ) = build_report_from_discord(
         state=state,
         env=env,
@@ -3956,5 +4215,12 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"Help + 工单每日总结处理失败：{exc}", file=sys.stderr)
+        safe_reason = sanitize_ocr_evidence_text(
+            str(exc),
+            max_length=180,
+        ) or type(exc).__name__
+        print(
+            f"Help + 工单每日总结处理失败：{safe_reason}",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
