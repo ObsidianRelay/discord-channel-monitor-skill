@@ -3273,7 +3273,7 @@ class DiscordChannelMonitor:
                 channels = self.support_message_state.setdefault("channels", {})
                 channel_state = channels.setdefault(channel_id, {})
                 # 先保存路由属性；即使首次正文请求失败，日报也能正确判断
-                # 该错误来自 Support 还是仅审计的 Event 路由。
+                # 该错误来自日报 Support 还是仅审计的其他工单路由。
                 channel_state.update(
                     {
                         "guild_id": guild_id,
