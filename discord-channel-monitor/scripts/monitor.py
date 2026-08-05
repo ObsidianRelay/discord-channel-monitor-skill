@@ -48,6 +48,9 @@ TICKET_NOTIFICATION_OUTBOX_FILE = (
     BASE_DIR / "data" / "ticket-notification-outbox.json"
 )
 HELP_MESSAGE_STATE_FILE = BASE_DIR / "data" / "help-message-state.json"
+MANUAL_FEEDBACK_RECEIPT_STATE_FILE = (
+    BASE_DIR / "data" / "manual-feedback-receipt-state.json"
+)
 TICKET_MESSAGE_STATE_FILE = BASE_DIR / "data" / "ticket-message-state.json"
 MEMBER_STATS_STATE_FILE = BASE_DIR / "data" / "member-stats-state.json"
 LEGACY_SUPPORT_MESSAGE_STATE_FILE = (
@@ -62,6 +65,12 @@ TICKET_NOTIFICATION_MAX_RETRY_SECONDS = 15 * 60.0
 DEFAULT_HELP_MESSAGE_RECONCILE_INTERVAL_SECONDS = 30.0
 DEFAULT_MEMBER_STATS_RECONCILE_INTERVAL_SECONDS = 300.0
 HELP_COLLECTION_CHECK_INTERVAL_SECONDS = 5.0
+MANUAL_FEEDBACK_RECEIPT_CHECK_INTERVAL_SECONDS = 5.0
+DEFAULT_MANUAL_FEEDBACK_RECONCILE_INTERVAL_SECONDS = 30.0
+MANUAL_FEEDBACK_BOOTSTRAP_LOOKBACK_HOURS = 24.0
+MANUAL_FEEDBACK_MAX_CONTEXT_MESSAGES = 50
+MANUAL_FEEDBACK_MAX_CONTEXT_CHARS = 20_000
+MANUAL_FEEDBACK_MAX_PROCESSED_IDS = 5000
 SUPPORT_MESSAGE_RETENTION_HOURS = 168.0
 SUPPORT_MAX_CONTENT_LENGTH = 1200
 DEFAULT_SUPPORT_OCR_MAX_IMAGES = 3
@@ -101,6 +110,23 @@ MEMBER_STATS_NAME_PATTERN = re.compile(
     r"^\s*Verified\s*:\s*(\d{1,3}(?:,\d{3})*|\d+)\s*$",
     re.IGNORECASE,
 )
+MANUAL_SOURCE_PATTERN = re.compile(
+    r"^\s*(?:来源|平台|source|platform)\s*[:：]\s*(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+MANUAL_USERNAME_PATTERN = re.compile(
+    r"^\s*(?:用户名|用户账号|user(?:name)?|handle)\s*[:：]\s*"
+    r"(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+MANUAL_USER_TURN_PATTERN = re.compile(
+    r"^\s*(?:用户|客户|买家|user|customer|buyer)\s*[:：]\s*\S+",
+    re.IGNORECASE,
+)
+DISCORD_USER_MENTION_FULL_PATTERN = re.compile(r"<@!?(?P<id>\d{15,22})>")
+MANUAL_SUBMIT_WORDS = {"提交", "submit"}
+MANUAL_CANCEL_WORDS = {"取消", "cancel"}
+MANUAL_START_WORDS = {"开始录入", "start"}
 ACTIVE_BUSINESS_PROFILE: BusinessProfile = GENERIC_PROFILE
 ACTIVE_BUSINESS_PROFILE_DIGEST = ""
 
@@ -223,7 +249,7 @@ def configure_runtime(config: dict[str, str]) -> None:
     global HERMES_BIN
     global TICKET_EVENT_FILE, TICKET_ROUTES_FILE
     global PENDING_MESSAGE_FILE, TICKET_NOTIFICATION_OUTBOX_FILE
-    global HELP_MESSAGE_STATE_FILE
+    global HELP_MESSAGE_STATE_FILE, MANUAL_FEEDBACK_RECEIPT_STATE_FILE
     global TICKET_MESSAGE_STATE_FILE, MEMBER_STATS_STATE_FILE
     global LEGACY_SUPPORT_MESSAGE_STATE_FILE
     global SUPPORT_OCR_HELPER
@@ -267,6 +293,11 @@ def configure_runtime(config: dict[str, str]) -> None:
         config,
         "DISCORD_HELP_MESSAGE_STATE_FILE",
         state_dir / "data" / "help-message-state.json",
+    )
+    MANUAL_FEEDBACK_RECEIPT_STATE_FILE = configured_path(
+        config,
+        "DISCORD_MANUAL_FEEDBACK_RECEIPT_STATE_FILE",
+        state_dir / "data" / "manual-feedback-receipt-state.json",
     )
     TICKET_MESSAGE_STATE_FILE = configured_path(
         config,
@@ -603,6 +634,67 @@ def load_help_message_state() -> dict[str, Any]:
     return {
         "last_seen_message_id": last_seen_message_id,
         "collection_outbox": collection_outbox,
+    }
+
+
+def load_manual_feedback_receipt_state() -> dict[str, Any]:
+    """恢复人工录入回执游标和可靠发送队列，不保存完整对话正文。"""
+    empty_state: dict[str, Any] = {
+        "last_seen_message_id": "",
+        "processed_submission_ids": [],
+        "receipt_outbox": {},
+    }
+    if not MANUAL_FEEDBACK_RECEIPT_STATE_FILE.exists():
+        return empty_state
+    try:
+        raw_state = json.loads(
+            MANUAL_FEEDBACK_RECEIPT_STATE_FILE.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError):
+        return empty_state
+    if not isinstance(raw_state, dict):
+        return empty_state
+
+    last_seen_message_id = str(raw_state.get("last_seen_message_id") or "")
+    if last_seen_message_id and not last_seen_message_id.isdigit():
+        last_seen_message_id = ""
+    processed_submission_ids = [
+        str(message_id)
+        for message_id in (raw_state.get("processed_submission_ids") or [])
+        if str(message_id).isdigit()
+    ][-MANUAL_FEEDBACK_MAX_PROCESSED_IDS:]
+
+    receipt_outbox: dict[str, dict[str, Any]] = {}
+    raw_outbox = raw_state.get("receipt_outbox")
+    if isinstance(raw_outbox, dict):
+        for submission_id, raw_item in raw_outbox.items():
+            submission_id = str(submission_id)
+            if not submission_id.isdigit() or not isinstance(raw_item, dict):
+                continue
+            status = str(raw_item.get("status") or "")
+            if status not in {"accepted", "rejected"}:
+                continue
+            try:
+                next_attempt_at = float(raw_item.get("next_attempt_at") or 0)
+                attempt_count = max(0, int(raw_item.get("attempt_count") or 0))
+            except (TypeError, ValueError):
+                continue
+            receipt_outbox[submission_id] = {
+                "status": status,
+                "platform": str(raw_item.get("platform") or "其他")[:40],
+                "username": str(raw_item.get("username") or "未知用户")[:80],
+                "reason": str(raw_item.get("reason") or "")[:200],
+                "submitted_at": str(raw_item.get("submitted_at") or "")[:40],
+                "next_attempt_at": next_attempt_at,
+                "attempt_count": attempt_count,
+            }
+
+    return {
+        "last_seen_message_id": last_seen_message_id,
+        "processed_submission_ids": list(
+            dict.fromkeys(processed_submission_ids)
+        ),
+        "receipt_outbox": receipt_outbox,
     }
 
 
@@ -1497,6 +1589,97 @@ def staff_response_matches_pending(
     return str(pending.get("user_id") or "") in mentioned_user_ids
 
 
+def strip_manual_submit_marker(content: str) -> tuple[str, bool]:
+    """识别最后一行“提交/submit”，并返回去掉命令后的正文。"""
+    lines = str(content or "").replace("\r\n", "\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[-1].strip().casefold() not in MANUAL_SUBMIT_WORDS:
+        return "\n".join(lines).strip(), False
+    return "\n".join(lines[:-1]).strip(), True
+
+
+def safe_manual_receipt_field(value: Any, *, maximum: int) -> str:
+    """清理回执中的短字段，禁止正文或换行混入 Telegram。"""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()[:maximum]
+
+
+def inspect_manual_feedback_content(
+    content: str,
+) -> tuple[bool, str, str, str]:
+    """只校验人工录入结构；不保存或发送完整对话正文。"""
+    platform = "其他"
+    username = ""
+    has_user_turn = False
+    for raw_line in str(content or "").replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        source_match = MANUAL_SOURCE_PATTERN.fullmatch(line)
+        if source_match:
+            platform = safe_manual_receipt_field(
+                source_match.group("value"),
+                maximum=40,
+            ) or "其他"
+            continue
+        username_match = MANUAL_USERNAME_PATTERN.fullmatch(line)
+        if username_match:
+            username = safe_manual_receipt_field(
+                username_match.group("value"),
+                maximum=80,
+            ).lstrip("@").strip()
+            continue
+        if MANUAL_USER_TURN_PATTERN.match(line):
+            has_user_turn = True
+
+    if not username:
+        return False, platform, "未知用户", "未识别到“用户名：”"
+    if not has_user_turn:
+        return False, platform, username, "未识别到“用户：”问题内容"
+    return True, platform, username, ""
+
+
+def build_manual_feedback_receipt(item: dict[str, Any]) -> str:
+    """生成发送到独立 Telegram 话题的人工录入回执。"""
+    status = str(item.get("status") or "")
+    platform = safe_manual_receipt_field(
+        item.get("platform") or "其他",
+        maximum=40,
+    ) or "其他"
+    username = safe_manual_receipt_field(
+        item.get("username") or "未知用户",
+        maximum=80,
+    ).lstrip("@").strip() or "未知用户"
+    submitted_at = safe_manual_receipt_field(
+        item.get("submitted_at") or "",
+        maximum=40,
+    )
+    if status == "accepted":
+        lines = [
+            "✅ 人工问题已收录",
+            f"用户名：@{username}" if username != "未知用户" else "用户名：未知用户",
+            f"来源：{platform}",
+            "状态：等待日报自动分析",
+        ]
+        if submitted_at:
+            lines.append(f"收录时间：{submitted_at}")
+        lines.append("将进入：每日10:00日报及周五17:00周报")
+        return "\n".join(lines)
+
+    reason = safe_manual_receipt_field(
+        item.get("reason") or "格式无法识别",
+        maximum=200,
+    ) or "格式无法识别"
+    return "\n".join(
+        [
+            "❌ 人工问题未收录",
+            f"原因：{reason}",
+            "请补充“用户名：”和“用户：”后重新发送，并以“提交”结尾。",
+        ]
+    )
+
+
 def build_alert(payload: dict[str, Any]) -> str:
     """把 Discord MESSAGE_CREATE 事件整理成适合 Telegram 阅读的提醒。"""
     author = payload.get("author") or {}
@@ -1805,6 +1988,16 @@ class DiscordChannelMonitor:
             raise RuntimeError(
                 "DISCORD_MEMBER_STATS_CHANNEL_ID 必须是纯数字频道 ID。"
             )
+        self.manual_feedback_channel_id = str(
+            config.get("DISCORD_MANUAL_FEEDBACK_CHANNEL_ID") or ""
+        ).strip()
+        if (
+            self.manual_feedback_channel_id
+            and not self.manual_feedback_channel_id.isdigit()
+        ):
+            raise RuntimeError(
+                "DISCORD_MANUAL_FEEDBACK_CHANNEL_ID 必须是纯数字频道 ID。"
+            )
 
         self.telegram_target = config.get("HERMES_NOTIFY_TARGET", "telegram").strip() or "telegram"
         self.help_collection_target = config.get(
@@ -1819,6 +2012,25 @@ class DiscordChannelMonitor:
             raise RuntimeError(
                 "HELP_COLLECTION_ENABLED=true 时必须配置 "
                 "HERMES_HELP_COLLECTION_TARGET。"
+            )
+        self.manual_feedback_receipt_target = str(
+            config.get("HERMES_MANUAL_FEEDBACK_RECEIPT_TARGET") or ""
+        ).strip()
+        self.manual_feedback_receipt_enabled = env_bool(
+            config.get("MANUAL_FEEDBACK_RECEIPT_ENABLED"),
+            default=bool(
+                self.manual_feedback_channel_id
+                and self.manual_feedback_receipt_target
+            ),
+        )
+        if self.manual_feedback_receipt_enabled and not (
+            self.manual_feedback_channel_id
+            and self.manual_feedback_receipt_target
+        ):
+            raise RuntimeError(
+                "MANUAL_FEEDBACK_RECEIPT_ENABLED=true 时必须同时配置 "
+                "DISCORD_MANUAL_FEEDBACK_CHANNEL_ID 和 "
+                "HERMES_MANUAL_FEEDBACK_RECEIPT_TARGET。"
             )
         self.ticket_default_target = (
             config.get("HERMES_TICKET_NOTIFY_TARGET", self.telegram_target).strip()
@@ -1957,6 +2169,21 @@ class DiscordChannelMonitor:
             configured_help_reconcile_interval,
         )
         try:
+            configured_manual_reconcile_interval = float(
+                config.get(
+                    "MANUAL_FEEDBACK_RECONCILE_INTERVAL_SECONDS",
+                    str(DEFAULT_MANUAL_FEEDBACK_RECONCILE_INTERVAL_SECONDS),
+                )
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "MANUAL_FEEDBACK_RECONCILE_INTERVAL_SECONDS 必须是数字。"
+            ) from exc
+        self.manual_feedback_reconcile_interval_seconds = max(
+            15.0,
+            configured_manual_reconcile_interval,
+        )
+        try:
             configured_member_stats_interval = float(
                 config.get(
                     "MEMBER_STATS_RECONCILE_INTERVAL_SECONDS",
@@ -1991,6 +2218,7 @@ class DiscordChannelMonitor:
         self.resume_gateway_url: str | None = None
         self.self_user_id: str | None = None
         self.help_guild_id: str = ""
+        self.manual_feedback_guild_id: str = ""
         self.stop_event = asyncio.Event()
         self.heartbeat_ack_event = asyncio.Event()
         self.notification_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=1000)
@@ -2010,6 +2238,13 @@ class DiscordChannelMonitor:
         self.help_reconciliation_lock = asyncio.Lock()
         self.help_reconciliation_ready = asyncio.Event()
         self.help_reconciliation_requested = asyncio.Event()
+        self.manual_feedback_receipt_state = (
+            load_manual_feedback_receipt_state()
+        )
+        self.manual_feedback_receipt_lock = asyncio.Lock()
+        self.manual_feedback_reconciliation_lock = asyncio.Lock()
+        self.manual_feedback_reconciliation_requested = asyncio.Event()
+        self.manual_feedback_receipt_wakeup = asyncio.Event()
         self.ticket_reconciliation_requested = asyncio.Event()
         self.member_stats_state = load_member_stats_state()
         self.member_stats_lock = asyncio.Lock()
@@ -2487,6 +2722,452 @@ class DiscordChannelMonitor:
         )
         temporary_file.chmod(0o600)
         temporary_file.replace(HELP_MESSAGE_STATE_FILE)
+
+    def save_manual_feedback_receipt_state(self) -> None:
+        """原子保存人工录入回执状态；不落盘保存完整对话正文。"""
+        MANUAL_FEEDBACK_RECEIPT_STATE_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        temporary_file = MANUAL_FEEDBACK_RECEIPT_STATE_FILE.with_suffix(
+            ".json.tmp"
+        )
+        temporary_file.write_text(
+            json.dumps(
+                self.manual_feedback_receipt_state,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary_file.chmod(0o600)
+        temporary_file.replace(MANUAL_FEEDBACK_RECEIPT_STATE_FILE)
+
+    async def resolve_manual_feedback_guild_id(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> str:
+        """从人工录入频道识别 Discord 服务器 ID。"""
+        if self.manual_feedback_guild_id:
+            return self.manual_feedback_guild_id
+        channel = await self.discord_api_get(
+            session,
+            f"/channels/{self.manual_feedback_channel_id}",
+        )
+        guild_id = str((channel or {}).get("guild_id") or "")
+        if not guild_id.isdigit():
+            raise RuntimeError("无法从人工录入频道识别 Discord 服务器 ID。")
+        self.manual_feedback_guild_id = guild_id
+        return guild_id
+
+    async def collect_manual_submission_content(
+        self,
+        session: aiohttp.ClientSession,
+        payload: dict[str, Any],
+    ) -> str:
+        """按提交人向前收集本次缓冲；只在内存中短暂保留正文。"""
+        submission_id = str(payload.get("id") or "")
+        author_id = str((payload.get("author") or {}).get("id") or "")
+        current_body, submitted = strip_manual_submit_marker(
+            str(payload.get("content") or "")
+        )
+        if not submitted or not submission_id.isdigit() or not author_id.isdigit():
+            return ""
+
+        chunks_newest_first: list[str] = []
+        if current_body:
+            chunks_newest_first.append(current_body)
+        before_message_id = submission_id
+        boundary_found = False
+        own_message_count = 1 if current_body else 0
+
+        for _ in range(5):
+            messages = await self.discord_api_get(
+                session,
+                f"/channels/{self.manual_feedback_channel_id}/messages?"
+                f"before={before_message_id}&limit=100",
+            )
+            if not isinstance(messages, list):
+                raise RuntimeError("人工录入历史消息返回了意外的数据格式。")
+            if not messages:
+                break
+            valid_ids: list[int] = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                message_id = str(message.get("id") or "")
+                if message_id.isdigit():
+                    valid_ids.append(int(message_id))
+                previous_author_id = str(
+                    (message.get("author") or {}).get("id") or ""
+                )
+                if previous_author_id != author_id:
+                    continue
+                content = str(message.get("content") or "").strip()
+                command = content.casefold()
+                if command in MANUAL_START_WORDS or command in MANUAL_CANCEL_WORDS:
+                    boundary_found = True
+                    break
+                previous_body, previous_submitted = strip_manual_submit_marker(
+                    content
+                )
+                if previous_submitted:
+                    boundary_found = True
+                    break
+                if previous_body:
+                    chunks_newest_first.append(previous_body)
+                    own_message_count += 1
+                    if own_message_count >= MANUAL_FEEDBACK_MAX_CONTEXT_MESSAGES:
+                        boundary_found = True
+                        break
+            if boundary_found or len(messages) < 100 or not valid_ids:
+                break
+            before_message_id = str(min(valid_ids))
+
+        combined = "\n".join(reversed(chunks_newest_first)).strip()
+        return combined[:MANUAL_FEEDBACK_MAX_CONTEXT_CHARS]
+
+    async def resolve_manual_receipt_username(
+        self,
+        session: aiohttp.ClientSession,
+        username: str,
+        payload: dict[str, Any],
+    ) -> str:
+        """把 Discord 自动生成的 <@用户ID> 提及还原为公开用户名。"""
+        normalized = safe_manual_receipt_field(username, maximum=80)
+        match = DISCORD_USER_MENTION_FULL_PATTERN.fullmatch(normalized)
+        if not match:
+            return normalized.lstrip("@").strip()
+        user_id = match.group("id")
+        for mention in payload.get("mentions") or []:
+            if not isinstance(mention, dict):
+                continue
+            if str(mention.get("id") or "") != user_id:
+                continue
+            resolved = safe_manual_receipt_field(
+                mention.get("username") or "",
+                maximum=80,
+            ).lstrip("@").strip()
+            if resolved:
+                return resolved
+        user_payload = await self.discord_api_get(
+            session,
+            f"/users/{user_id}",
+        )
+        resolved = safe_manual_receipt_field(
+            (user_payload or {}).get("username") or "",
+            maximum=80,
+        ).lstrip("@").strip()
+        if not resolved:
+            raise RuntimeError("无法把 Discord 用户提及还原为用户名。")
+        return resolved
+
+    async def process_manual_feedback_message(
+        self,
+        session: aiohttp.ClientSession,
+        payload: dict[str, Any],
+        *,
+        guild_id: str,
+    ) -> bool:
+        """识别一次“提交”并写入可靠回执队列；返回是否形成回执。"""
+        message_id = str(payload.get("id") or "")
+        author = payload.get("author") or {}
+        if (
+            not message_id.isdigit()
+            or bool(author.get("bot"))
+            or str(payload.get("channel_id") or "")
+            != self.manual_feedback_channel_id
+        ):
+            return False
+        _body, submitted = strip_manual_submit_marker(
+            str(payload.get("content") or "")
+        )
+        if not submitted:
+            return False
+
+        async with self.manual_feedback_receipt_lock:
+            processed = set(
+                self.manual_feedback_receipt_state.get(
+                    "processed_submission_ids"
+                )
+                or []
+            )
+            if message_id in processed:
+                return False
+
+        await self.ensure_support_member_roles(
+            session,
+            payload,
+            guild_id=guild_id,
+        )
+        if not member_has_any_role(payload, self.reply_role_ids):
+            timestamped_log("忽略一条无人工录入权限的提交消息。")
+            return False
+
+        combined = await self.collect_manual_submission_content(session, payload)
+        accepted, platform, username, reason = inspect_manual_feedback_content(
+            combined
+        )
+        if accepted:
+            username = await self.resolve_manual_receipt_username(
+                session,
+                username,
+                payload,
+            )
+        try:
+            submitted_at = discord_snowflake_time(message_id).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except (TypeError, ValueError, OverflowError):
+            submitted_at = datetime.now(
+                ZoneInfo("Asia/Shanghai")
+            ).strftime("%Y-%m-%d %H:%M")
+        receipt_item = {
+            "status": "accepted" if accepted else "rejected",
+            "platform": platform,
+            "username": username,
+            "reason": reason,
+            "submitted_at": submitted_at,
+            "next_attempt_at": 0.0,
+            "attempt_count": 0,
+        }
+        async with self.manual_feedback_receipt_lock:
+            processed_ids = list(
+                self.manual_feedback_receipt_state.setdefault(
+                    "processed_submission_ids",
+                    [],
+                )
+            )
+            if message_id in processed_ids:
+                return False
+            processed_ids.append(message_id)
+            self.manual_feedback_receipt_state[
+                "processed_submission_ids"
+            ] = processed_ids[-MANUAL_FEEDBACK_MAX_PROCESSED_IDS:]
+            self.manual_feedback_receipt_state.setdefault(
+                "receipt_outbox",
+                {},
+            )[message_id] = receipt_item
+            self.save_manual_feedback_receipt_state()
+        self.manual_feedback_receipt_wakeup.set()
+        timestamped_log(
+            "人工问题提交已进入回执队列。"
+            if accepted
+            else "人工问题格式校验失败，失败回执已入队。"
+        )
+        return True
+
+    async def reconcile_manual_feedback_messages(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        gateway_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """有序补收人工录入消息，防止休眠或断线期间漏回执。"""
+        if not self.manual_feedback_receipt_enabled:
+            return
+        async with self.manual_feedback_reconciliation_lock:
+            guild_id = await self.resolve_manual_feedback_guild_id(session)
+            async with self.manual_feedback_receipt_lock:
+                last_seen_message_id = str(
+                    self.manual_feedback_receipt_state.get(
+                        "last_seen_message_id"
+                    )
+                    or ""
+                )
+
+            unseen_messages: dict[str, dict[str, Any]] = {}
+            if last_seen_message_id:
+                after_message_id = last_seen_message_id
+                for _ in range(10):
+                    messages = await self.discord_api_get(
+                        session,
+                        f"/channels/{self.manual_feedback_channel_id}/messages?"
+                        f"after={after_message_id}&limit=100",
+                    )
+                    if not isinstance(messages, list):
+                        raise RuntimeError(
+                            "人工录入补收返回了意外的数据格式。"
+                        )
+                    for message in messages:
+                        if not isinstance(message, dict):
+                            continue
+                        message_id = str(message.get("id") or "")
+                        if message_id.isdigit():
+                            unseen_messages[message_id] = message
+                    if len(messages) < 100:
+                        break
+                    next_after = max(
+                        (
+                            str(message.get("id") or "0")
+                            for message in messages
+                            if isinstance(message, dict)
+                        ),
+                        key=int,
+                    )
+                    if next_after == after_message_id:
+                        break
+                    after_message_id = next_after
+            else:
+                recent_messages = await self.discord_api_get(
+                    session,
+                    f"/channels/{self.manual_feedback_channel_id}/messages?limit=100",
+                )
+                if not isinstance(recent_messages, list):
+                    raise RuntimeError(
+                        "人工录入初始补收返回了意外的数据格式。"
+                    )
+                for message in recent_messages:
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = str(message.get("id") or "")
+                    if message_id.isdigit():
+                        unseen_messages[message_id] = message
+
+            gateway_message_id = str(
+                (gateway_payload or {}).get("id") or ""
+            )
+            if (
+                gateway_message_id.isdigit()
+                and str((gateway_payload or {}).get("channel_id") or "")
+                == self.manual_feedback_channel_id
+                and (
+                    not last_seen_message_id
+                    or int(gateway_message_id) > int(last_seen_message_id)
+                )
+            ):
+                unseen_messages[gateway_message_id] = dict(
+                    gateway_payload or {}
+                )
+
+            bootstrap_cutoff = datetime.now(timezone.utc) - timedelta(
+                hours=MANUAL_FEEDBACK_BOOTSTRAP_LOOKBACK_HOURS
+            )
+            ordered_message_ids = sorted(unseen_messages, key=int)
+            receipt_count = 0
+            for message_id in ordered_message_ids:
+                message = unseen_messages[message_id]
+                message["guild_id"] = str(
+                    message.get("guild_id") or guild_id
+                )
+                should_process = bool(last_seen_message_id)
+                if not should_process:
+                    try:
+                        should_process = (
+                            discord_snowflake_time(message_id).astimezone(
+                                timezone.utc
+                            )
+                            >= bootstrap_cutoff
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        should_process = True
+                if should_process and await self.process_manual_feedback_message(
+                    session,
+                    message,
+                    guild_id=guild_id,
+                ):
+                    receipt_count += 1
+                async with self.manual_feedback_receipt_lock:
+                    self.manual_feedback_receipt_state[
+                        "last_seen_message_id"
+                    ] = message_id
+                    self.save_manual_feedback_receipt_state()
+
+            if ordered_message_ids:
+                timestamped_log(
+                    "人工录入有序补收完成："
+                    f"扫描 {len(ordered_message_ids)} 条，"
+                    f"形成 {receipt_count} 条回执。"
+                )
+
+    async def manual_feedback_reconciliation_loop(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        """定时补收人工录入消息，并响应重连后的立即补读。"""
+        while not self.stop_event.is_set():
+            try:
+                await self.reconcile_manual_feedback_messages(session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                timestamped_log(
+                    "人工录入补收失败："
+                    f"{safe_log_error(exc)}",
+                    error=True,
+                )
+            self.manual_feedback_reconciliation_requested.clear()
+            try:
+                await asyncio.wait_for(
+                    self.manual_feedback_reconciliation_requested.wait(),
+                    timeout=self.manual_feedback_reconcile_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def manual_feedback_receipt_outbox_loop(self) -> None:
+        """可靠发送人工录入回执；失败后保留并自动重试。"""
+        while not self.stop_event.is_set():
+            self.manual_feedback_receipt_wakeup.clear()
+            now = time.time()
+            async with self.manual_feedback_receipt_lock:
+                due_items = [
+                    (submission_id, dict(item))
+                    for submission_id, item in (
+                        self.manual_feedback_receipt_state.get(
+                            "receipt_outbox"
+                        )
+                        or {}
+                    ).items()
+                    if float(item.get("next_attempt_at") or 0) <= now
+                ]
+
+            for submission_id, item in due_items:
+                try:
+                    async with self.hermes_send_lock:
+                        await send_via_hermes(
+                            self.manual_feedback_receipt_target,
+                            build_manual_feedback_receipt(item),
+                            attempts=1,
+                        )
+                    async with self.manual_feedback_receipt_lock:
+                        outbox = self.manual_feedback_receipt_state.get(
+                            "receipt_outbox"
+                        ) or {}
+                        outbox.pop(submission_id, None)
+                        self.save_manual_feedback_receipt_state()
+                    timestamped_log("一条人工问题回执已发送到 Telegram。")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    async with self.manual_feedback_receipt_lock:
+                        outbox = self.manual_feedback_receipt_state.get(
+                            "receipt_outbox"
+                        ) or {}
+                        current = outbox.get(submission_id)
+                        if current:
+                            attempt_count = int(
+                                current.get("attempt_count") or 0
+                            ) + 1
+                            current["attempt_count"] = attempt_count
+                            current["next_attempt_at"] = time.time() + min(
+                                60 * (2 ** max(0, attempt_count - 1)),
+                                15 * 60,
+                            )
+                            self.save_manual_feedback_receipt_state()
+                    timestamped_log(
+                        "人工问题回执发送失败："
+                        f"{safe_log_error(exc)}",
+                        error=True,
+                    )
+
+            try:
+                await asyncio.wait_for(
+                    self.manual_feedback_receipt_wakeup.wait(),
+                    timeout=MANUAL_FEEDBACK_RECEIPT_CHECK_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     def save_member_stats_state(self) -> None:
         """原子保存最新人数；文件仅当前用户可读写。"""
@@ -4119,6 +4800,20 @@ class DiscordChannelMonitor:
                 raise
             return
 
+        if (
+            self.manual_feedback_receipt_enabled
+            and channel_id == self.manual_feedback_channel_id
+        ):
+            try:
+                await self.reconcile_manual_feedback_messages(
+                    session,
+                    gateway_payload=payload,
+                )
+            except Exception:
+                self.manual_feedback_reconciliation_requested.set()
+                raise
+            return
+
         if channel_id not in self.support_channel_ids:
             return
         channel_state = (
@@ -4310,6 +5005,18 @@ class DiscordChannelMonitor:
                                 session,
                                 connection_label="Discord 连接",
                             )
+                            if self.manual_feedback_receipt_enabled:
+                                try:
+                                    await self.reconcile_manual_feedback_messages(
+                                        session
+                                    )
+                                except Exception as exc:
+                                    self.manual_feedback_reconciliation_requested.set()
+                                    timestamped_log(
+                                        "Discord 连接后的人工录入优先补收失败："
+                                        f"{safe_log_error(exc)}",
+                                        error=True,
+                                    )
                             print("Discord 连接成功，正在监听指定频道。", flush=True)
                         elif event_type == "RESUMED":
                             self.ticket_reconciliation_requested.set()
@@ -4318,6 +5025,18 @@ class DiscordChannelMonitor:
                                 session,
                                 connection_label="Discord 会话恢复",
                             )
+                            if self.manual_feedback_receipt_enabled:
+                                try:
+                                    await self.reconcile_manual_feedback_messages(
+                                        session
+                                    )
+                                except Exception as exc:
+                                    self.manual_feedback_reconciliation_requested.set()
+                                    timestamped_log(
+                                        "Discord 会话恢复后的人工录入优先补收失败："
+                                        f"{safe_log_error(exc)}",
+                                        error=True,
+                                    )
                             print("Discord 会话已恢复，继续监听。", flush=True)
                         elif event_type == "MESSAGE_CREATE":
                             try:
@@ -4364,6 +5083,10 @@ class DiscordChannelMonitor:
     async def run(self) -> None:
         await self.discard_disabled_help_collection_outbox()
         self.telegram_target = await resolve_hermes_target(self.telegram_target)
+        if self.manual_feedback_receipt_enabled:
+            self.manual_feedback_receipt_target = await resolve_hermes_target(
+                self.manual_feedback_receipt_target
+            )
         worker_task = asyncio.create_task(self.notification_worker())
         ticket_notification_task = asyncio.create_task(
             self.ticket_notification_outbox_loop()
@@ -4372,6 +5095,8 @@ class DiscordChannelMonitor:
         pending_message_task: asyncio.Task[None] | None = None
         help_reconciliation_task: asyncio.Task[None] | None = None
         help_collection_task: asyncio.Task[None] | None = None
+        manual_feedback_reconciliation_task: asyncio.Task[None] | None = None
+        manual_feedback_receipt_task: asyncio.Task[None] | None = None
         support_ocr_task: asyncio.Task[None] | None = None
         member_stats_task: asyncio.Task[None] | None = None
 
@@ -4408,6 +5133,13 @@ class DiscordChannelMonitor:
                 help_reconciliation_task = asyncio.create_task(
                     self.help_message_reconciliation_loop(session)
                 )
+                if self.manual_feedback_receipt_enabled:
+                    manual_feedback_reconciliation_task = asyncio.create_task(
+                        self.manual_feedback_reconciliation_loop(session)
+                    )
+                    manual_feedback_receipt_task = asyncio.create_task(
+                        self.manual_feedback_receipt_outbox_loop()
+                    )
                 if self.member_stats_channel_id:
                     member_stats_task = asyncio.create_task(
                         self.member_stats_reconciliation_loop(session)
@@ -4450,6 +5182,8 @@ class DiscordChannelMonitor:
                         for task in (
                             member_stats_task,
                             support_ocr_task,
+                            manual_feedback_receipt_task,
+                            manual_feedback_reconciliation_task,
                             help_collection_task,
                             help_reconciliation_task,
                             pending_message_task,
@@ -4501,6 +5235,41 @@ def self_test() -> None:
     assert collection_alert == "用户：Alex (@buyer123)\n消息：请问设置页面为什么打不开？"
     assert "Help 频道消息汇总" not in collection_alert
     assert "https://discord.com/" not in collection_alert
+    manual_body, manual_submitted = strip_manual_submit_marker(
+        "来源：Discord\n"
+        "用户名：@.ashkann.\n\n"
+        "用户：Is there a dark mode?\n"
+        "客服：I will pass this suggestion to the technical team.\n"
+        "提交"
+    )
+    assert manual_submitted
+    accepted, platform, username, reason = inspect_manual_feedback_content(
+        manual_body
+    )
+    assert accepted and not reason
+    assert platform == "Discord"
+    assert username == ".ashkann."
+    receipt = build_manual_feedback_receipt(
+        {
+            "status": "accepted",
+            "platform": platform,
+            "username": username,
+            "submitted_at": "2026-08-05 10:29",
+        }
+    )
+    assert "✅ 人工问题已收录" in receipt
+    assert "@.ashkann." in receipt
+    rejected, _platform, _username, rejection_reason = (
+        inspect_manual_feedback_content("来源：Discord\n用户：Need help")
+    )
+    assert not rejected and "用户名" in rejection_reason
+    failure_receipt = build_manual_feedback_receipt(
+        {
+            "status": "rejected",
+            "reason": rejection_reason,
+        }
+    )
+    assert "❌ 人工问题未收录" in failure_receipt
     delayed_alert = build_delayed_alert(
         sample,
         delay_seconds=300,
