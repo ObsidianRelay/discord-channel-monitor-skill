@@ -171,6 +171,11 @@ MANUAL_USERNAME_PATTERN = re.compile(
     r"(?P<value>.+?)\s*$",
     re.IGNORECASE,
 )
+MANUAL_USERNAME_MENTION_LINE_PATTERN = re.compile(
+    r"^(?P<prefix>\s*(?:用户名|用户账号|user(?:name)?|handle)\s*[:：]\s*)"
+    r"<@!?(?P<id>\d{15,22})>(?P<suffix>\s*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
 MANUAL_TURN_PATTERN = re.compile(
     r"^\s*(?:\[[^\]]{1,30}\]\s*)?"
     r"(?P<speaker>[^:：\n]{1,50})\s*[:：]\s*(?P<text>.*)$"
@@ -879,6 +884,29 @@ def strip_manual_submit_marker(content: str) -> tuple[str, bool]:
     return "\n".join(lines[:-1]).strip(), True
 
 
+def resolve_manual_username_mention(
+    content: str,
+    mentions: Any,
+) -> str:
+    """只在“用户名”字段中把 Discord mention 还原为公开用户名。"""
+    username_by_id = {
+        str(item.get("id") or ""): safe_public_text(
+            item.get("username") or item.get("global_name") or "",
+            max_length=80,
+        ).lstrip("@").strip()
+        for item in (mentions or [])
+        if isinstance(item, dict) and str(item.get("id") or "").isdigit()
+    }
+
+    def replace(match: re.Match[str]) -> str:
+        username = username_by_id.get(match.group("id"), "")
+        if not username:
+            return match.group(0)
+        return f"{match.group('prefix')}@{username}{match.group('suffix')}"
+
+    return MANUAL_USERNAME_MENTION_LINE_PATTERN.sub(replace, str(content or ""))
+
+
 def parse_manual_submission(
     *,
     content: str,
@@ -1041,7 +1069,12 @@ def fetch_manual_context_messages(
     report_start: datetime,
     end_time: datetime,
 ) -> list[dict[str, Any]]:
-    """读取人工录入频道；按录入人员缓冲，收到“提交”后才形成案例。"""
+    """读取可信私密频道；按录入人员缓冲，收到“提交”后形成案例。
+
+    ``staff_role_ids`` 仅为兼容现有调用签名保留。权限由固定频道的
+    Discord 访问控制负责，不再依赖历史消息中可能缺失的身份组字段。
+    """
+    del staff_role_ids
     if not channel_id:
         return []
     if not channel_id.isdigit():
@@ -1057,7 +1090,6 @@ def fetch_manual_context_messages(
 
     before_message_id = ""
     raw_messages: list[dict[str, Any]] = []
-    member_cache: dict[str, dict[str, Any]] = {}
     for _ in range(MAX_PAGES):
         query: dict[str, str | int] = {"limit": 100}
         if before_message_id:
@@ -1090,18 +1122,6 @@ def fetch_manual_context_messages(
             author = raw_message.get("author") or {}
             if author.get("bot"):
                 continue
-            ensure_member_roles(
-                token=token,
-                guild_id=guild_id,
-                message=raw_message,
-                member_cache=member_cache,
-            )
-            roles = {
-                str(item)
-                for item in ((raw_message.get("member") or {}).get("roles") or [])
-            }
-            if not staff_role_ids or roles.isdisjoint(staff_role_ids):
-                continue
             raw_message["_created_at"] = created_at
             raw_messages.append(raw_message)
         if reached_start or len(page) < 100 or not valid_ids:
@@ -1132,7 +1152,10 @@ def fetch_manual_context_messages(
         body, submitted = strip_manual_submit_marker(content)
         if body:
             buffered = dict(raw_message)
-            buffered["_manual_body"] = body
+            buffered["_manual_body"] = resolve_manual_username_mention(
+                body,
+                raw_message.get("mentions"),
+            )
             buffers.setdefault(author_id, []).append(buffered)
             buffers[author_id] = buffers[author_id][-50:]
         if not submitted:

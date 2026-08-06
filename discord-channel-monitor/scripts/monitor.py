@@ -2869,7 +2869,8 @@ class DiscordChannelMonitor:
         *,
         guild_id: str,
     ) -> bool:
-        """识别一次“提交”并写入可靠回执队列；返回是否形成回执。"""
+        """信任固定私密频道的真人提交，并写入可靠回执队列。"""
+        del guild_id  # 权限由频道访问控制负责，不再二次查询身份组。
         message_id = str(payload.get("id") or "")
         author = payload.get("author") or {}
         if (
@@ -2894,15 +2895,6 @@ class DiscordChannelMonitor:
             )
             if message_id in processed:
                 return False
-
-        await self.ensure_support_member_roles(
-            session,
-            payload,
-            guild_id=guild_id,
-        )
-        if not member_has_any_role(payload, self.reply_role_ids):
-            timestamped_log("忽略一条无人工录入权限的提交消息。")
-            return False
 
         combined = await self.collect_manual_submission_content(session, payload)
         accepted, platform, username, reason = inspect_manual_feedback_content(
